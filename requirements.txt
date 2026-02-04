@@ -1,0 +1,6 @@
+aiogram==3.*
+SQLAlchemy==2.*
+asyncpg
+alembic
+pydantic-settings
+passlib[argon2]
