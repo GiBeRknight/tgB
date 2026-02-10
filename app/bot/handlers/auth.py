@@ -27,7 +27,7 @@ async def _show_menu(
 
 @router.message(CommandStart())
 async def handle_start(message: Message, state: FSMContext) -> None:
-    async for session in get_session():
+    async with get_session() as session:
         users_repo = UsersRepository(session)
         plots_repo = PlotsRepository(session)
         existing = await users_repo.get_by_telegram_id(message.from_user.id)
@@ -44,7 +44,7 @@ async def handle_start(message: Message, state: FSMContext) -> None:
 
 @router.message(Command("logout"))
 async def handle_logout(message: Message, state: FSMContext) -> None:
-    async for session in get_session():
+    async with get_session() as session:
         users_repo = UsersRepository(session)
         await users_repo.unbind_telegram_id(message.from_user.id)
     await state.clear()
@@ -80,7 +80,7 @@ async def handle_register_password(message: Message, state: FSMContext) -> None:
         await state.set_state(AuthStates.reg_username)
         await message.answer("Введите username:")
         return
-    async for session in get_session():
+    async with get_session() as session:
         users_repo = UsersRepository(session)
         plots_repo = PlotsRepository(session)
         try:
@@ -116,11 +116,11 @@ async def handle_login_password(message: Message, state: FSMContext) -> None:
         await state.set_state(AuthStates.login_username)
         await message.answer("Введите username:")
         return
-    async for session in get_session():
+    async with get_session() as session:
         users_repo = UsersRepository(session)
         plots_repo = PlotsRepository(session)
         try:
-            await auth_service.login(
+            user = await auth_service.login(
                 users_repo, username, message.text, message.from_user.id
             )
         except auth_service.InvalidCredentials as exc:

@@ -26,18 +26,18 @@ PLOT_NUMBER_RE = re.compile(r"^[A-Za-z0-9_-]{1,20}$")
 
 
 async def _ensure_admin(message: Message) -> bool:
-    async for session in get_session():
+    async with get_session() as session:
         users_repo = UsersRepository(session)
         user = await users_repo.get_by_telegram_id(message.from_user.id)
-    return user is not None and user.is_admin
+        return user is not None and user.is_admin
 
 
 async def _show_menu(message: Message, state: FSMContext) -> None:
-    async for session in get_session():
+    async with get_session() as session:
         plots_repo = PlotsRepository(session)
         places = await plots_repo.get_places_list(limit=6)
-    await state.set_state(PlotStates.choose_place)
-    await message.answer("Выберите участок:", reply_markup=menu_keyboard(places, True))
+        await state.set_state(PlotStates.choose_place)
+        await message.answer("Выберите участок:", reply_markup=menu_keyboard(places, True))
 
 
 @router.message(AdminStates.choose)
@@ -131,7 +131,7 @@ async def handle_add_is_sold(message: Message, state: FSMContext) -> None:
         await message.answer("Ответьте 'да' или 'нет'.")
         return
     data = await state.get_data()
-    async for session in get_session():
+    async with get_session() as session:
         plots_repo = PlotsRepository(session)
         try:
             await plots_repo.create_plot(
@@ -189,14 +189,14 @@ async def handle_mark_is_sold(message: Message, state: FSMContext) -> None:
         await message.answer("Ответьте 'да' или 'нет'.")
         return
     data = await state.get_data()
-    async for session in get_session():
+    async with get_session() as session:
         plots_repo = PlotsRepository(session)
         plot = await plots_repo.set_sold(
             data["place_name"], data["plot_number"], answer == "да"
         )
-    if plot is None:
-        await message.answer("Участок не найден. Проверьте данные и попробуйте снова.")
-        await state.set_state(AdminStates.mark_plot_number)
-        return
+        if plot is None:
+            await message.answer("Участок не найден. Проверьте данные и попробуйте снова.")
+            await state.set_state(AdminStates.mark_plot_number)
+            return
     await message.answer("Статус участка обновлен.")
     await _show_menu(message, state)
