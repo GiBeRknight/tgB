@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 
 async def _check_db_connection() -> None:
-    async for session in get_session():
+    async with get_session() as session:
         await session.execute(text("SELECT 1"))
     logger.info("DB connected OK")
 

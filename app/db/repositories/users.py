@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -60,7 +60,7 @@ class UsersRepository:
         user = result.scalar_one_or_none()
         if user is None:
             return None
-        user.last_login_at = datetime.utcnow()
+        user.last_login_at = datetime.now(timezone.utc)
         await self._session.commit()
         await self._session.refresh(user)
         return user
