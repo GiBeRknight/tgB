@@ -29,4 +29,5 @@ class Region(Base):
     plots_number: Mapped[int] = mapped_column(Integer)
     describe: Mapped[str | None] = mapped_column(Text, nullable=True)
     link_map: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    size: Mapped[int] = mapped_column(Integer, default=5)
     link_youtube: Mapped[str | None] = mapped_column(String(500), nullable=True)

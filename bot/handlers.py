@@ -20,6 +20,7 @@ STATE_LOGIN_PASSWORD = "login_password"
 STATE_ADD_NAME = "add_name"
 STATE_ADD_PRICE = "add_price"
 STATE_ADD_PLOTS = "add_plots"
+STATE_ADD_SIZE = "add_size"
 STATE_ADD_DESCRIBE = "add_describe"
 STATE_ADD_LINK_MAP = "add_link_map"
 STATE_ADD_LINK_YOUTUBE = "add_link_youtube"
@@ -60,6 +61,7 @@ FIELD_LABELS = {
     "name": "Назва",
     "price": "Ціна",
     "plots_number": "Кількість ділянок",
+    "size": "Розмір (сотки)",
     "describe": "Опис",
     "link_map": "Посилання на карту",
     "link_youtube": "Посилання на YouTube",
@@ -274,6 +276,7 @@ async def _handle_copy_pick(query, context, copy_field: str):
             "name": region.name,
             "price": region.price,
             "plots_number": region.plots_number,
+            "size": region.size,
             "describe": region.describe,
             "link_map": region.link_map,
             "link_youtube": region.link_youtube,
@@ -348,6 +351,8 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _on_add_price(update, context)
     elif state == STATE_ADD_PLOTS:
         await _on_add_plots(update, context)
+    elif state == STATE_ADD_SIZE:
+        await _on_add_size(update, context)
     elif state == STATE_ADD_DESCRIBE:
         await _on_add_describe(update, context)
     elif state == STATE_ADD_LINK_MAP:
@@ -408,6 +413,20 @@ async def _on_add_plots(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Невірний формат. Введіть ціле число:")
         return
     context.user_data["new_region"]["plots_number"] = plots
+    _set_state(context, STATE_ADD_SIZE)
+    await update.message.reply_text("Введіть розмір ділянки (сотки), або /skip (за замовч. 5):")
+
+
+async def _on_add_size(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text == "/skip":
+        context.user_data["new_region"]["size"] = 5
+    else:
+        try:
+            context.user_data["new_region"]["size"] = int(text)
+        except ValueError:
+            await update.message.reply_text("Невірний формат. Введіть ціле число:")
+            return
     _set_state(context, STATE_ADD_DESCRIBE)
     await update.message.reply_text("Введіть опис (або /skip):")
 
@@ -442,6 +461,7 @@ def _region_summary(data: dict) -> str:
         f"Назва: {data.get('name', '—')}\n"
         f"Ціна: {data.get('price', '—')}\n"
         f"Кількість ділянок: {data.get('plots_number', '—')}\n"
+        f"Розмір (сотки): {data.get('size', 5)}\n"
         f"Опис: {data.get('describe') or '—'}\n"
         f"Карта: {data.get('link_map') or '—'}\n"
         f"YouTube: {data.get('link_youtube') or '—'}"
@@ -488,7 +508,7 @@ async def _on_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except InvalidOperation:
             await update.message.reply_text("Невірний формат. Введіть число:")
             return
-    elif field == "plots_number":
+    elif field in ("plots_number", "size"):
         try:
             value = int(raw)
         except ValueError:

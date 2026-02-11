@@ -28,12 +28,15 @@ async def init_db():
                 raise
             await asyncio.sleep(2)
 
-    # Add is_admin column if missing (create_all won't alter existing tables)
-    try:
-        async with engine.begin() as conn:
-            await conn.execute(text(
-                "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN DEFAULT FALSE"
-            ))
-        logger.info("is_admin column ensured")
-    except Exception as exc:
-        logger.warning("Could not add is_admin column: %s", exc)
+    # Add missing columns (create_all won't alter existing tables)
+    alter_statements = [
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE regions ADD COLUMN IF NOT EXISTS size INTEGER DEFAULT 5",
+    ]
+    for stmt in alter_statements:
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(text(stmt))
+        except Exception as exc:
+            logger.warning("ALTER failed: %s — %s", stmt, exc)
+    logger.info("Schema migrations applied")
