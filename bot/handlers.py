@@ -24,6 +24,8 @@ STATE_ADD_DESCRIBE = "add_describe"
 STATE_ADD_LINK_MAP = "add_link_map"
 STATE_ADD_LINK_YOUTUBE = "add_link_youtube"
 STATE_EDIT_VALUE = "edit_value"
+STATE_COPY_NEW_PRICE = "copy_new_price"
+STATE_COPY_NEW_NAME = "copy_new_name"
 
 # --- Keyboards ---
 START_KEYBOARD = InlineKeyboardMarkup(
@@ -38,6 +40,8 @@ START_KEYBOARD = InlineKeyboardMarkup(
 ADMIN_MENU = InlineKeyboardMarkup(
     [
         [InlineKeyboardButton("Додати новий", callback_data="admin_add")],
+        [InlineKeyboardButton("Копіювати з новою ціною", callback_data="admin_copy_price")],
+        [InlineKeyboardButton("Копіювати з новим ім'ям", callback_data="admin_copy_name")],
         [InlineKeyboardButton("Редагувати", callback_data="admin_edit")],
         [InlineKeyboardButton("Назад", callback_data="admin_back")],
     ]
@@ -143,6 +147,10 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _handle_admin_login(query, context)
     elif data == "admin_add":
         await _handle_admin_add(query, context)
+    elif data == "admin_copy_price":
+        await _handle_copy_list(query, context, "price")
+    elif data == "admin_copy_name":
+        await _handle_copy_list(query, context, "name")
     elif data == "admin_edit":
         await _handle_admin_edit(query, context)
     elif data == "admin_back":
@@ -151,6 +159,10 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Це бот першої земельної компанії, будь ласка оберіть який регіон вас цікавить",
             reply_markup=START_KEYBOARD,
         )
+    elif data.startswith("copyreg_price_"):
+        await _handle_copy_pick(query, context, "price")
+    elif data.startswith("copyreg_name_"):
+        await _handle_copy_pick(query, context, "name")
     elif data.startswith("editreg_"):
         await _handle_edit_pick_region(query, context)
     elif data.startswith("editfield_"):
@@ -217,6 +229,65 @@ async def _handle_admin_edit(query, context):
 
 
 # ──────────────────────────────────────
+#  Copy region (with new price / name)
+# ──────────────────────────────────────
+async def _handle_copy_list(query, context, copy_field: str):
+    async with async_session() as session:
+        user = await session.get(User, query.from_user.id)
+        if not user or not user.is_admin:
+            await query.edit_message_text("У вас немає прав адміністратора.")
+            return
+
+    async with async_session() as session:
+        regions = (await session.execute(select(Region))).scalars().all()
+    if not regions:
+        await query.edit_message_text(
+            "Немає регіонів для копіювання.", reply_markup=ADMIN_MENU
+        )
+        return
+    buttons = [
+        [InlineKeyboardButton(
+            f"{r.name} — {r.price}$" if r.price else r.name,
+            callback_data=f"copyreg_{copy_field}_{r.id}",
+        )]
+        for r in regions
+    ]
+    back_cb = "admin_copy_price" if copy_field == "price" else "admin_copy_name"
+    buttons.append([InlineKeyboardButton("Назад", callback_data="admin_back")])
+    keyboard = InlineKeyboardMarkup(buttons)
+    label = "ціною" if copy_field == "price" else "ім'ям"
+    await query.edit_message_text(
+        f"Оберіть регіон для копіювання з новою {label}:", reply_markup=keyboard
+    )
+
+
+async def _handle_copy_pick(query, context, copy_field: str):
+    prefix = f"copyreg_{copy_field}_"
+    region_id = int(query.data.replace(prefix, ""))
+
+    async with async_session() as session:
+        region = await session.get(Region, region_id)
+        if not region:
+            await query.edit_message_text("Регіон не знайдено.", reply_markup=ADMIN_MENU)
+            return
+        context.user_data["new_region"] = {
+            "name": region.name,
+            "price": region.price,
+            "plots_number": region.plots_number,
+            "describe": region.describe,
+            "link_map": region.link_map,
+            "link_youtube": region.link_youtube,
+        }
+
+    if copy_field == "price":
+        _set_state(context, STATE_COPY_NEW_PRICE)
+        await query.edit_message_text("Введіть нову ціну:")
+    else:
+        _set_state(context, STATE_COPY_NEW_NAME)
+        await query.edit_message_text("Введіть нове ім'я:")
+
+
+# ──────────────────────────────────────
 #  Edit region callbacks
 # ──────────────────────────────────────
 async def _handle_edit_pick_region(query, context):
@@ -265,7 +336,11 @@ async def _handle_add_confirm(query, context):
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = _get_state(context)
 
-    if state == STATE_LOGIN_PASSWORD:
+    if state == STATE_COPY_NEW_PRICE:
+        await _on_copy_new_price(update, context)
+    elif state == STATE_COPY_NEW_NAME:
+        await _on_copy_new_name(update, context)
+    elif state == STATE_LOGIN_PASSWORD:
         await _on_login_password(update, context)
     elif state == STATE_ADD_NAME:
         await _on_add_name(update, context)
@@ -355,16 +430,45 @@ async def _on_add_link_youtube(update: Update, context: ContextTypes.DEFAULT_TYP
     text = update.message.text.strip()
     context.user_data["new_region"]["link_youtube"] = None if text == "/skip" else text
 
-    data = context.user_data["new_region"]
-    summary = (
-        f"Назва: {data['name']}\n"
-        f"Ціна: {data['price']}\n"
-        f"Кількість ділянок: {data['plots_number']}\n"
+    _set_state(context, STATE_IDLE)
+    summary = _region_summary(context.user_data["new_region"])
+    await update.message.reply_text(
+        f"Зберегти?\n\n{summary}", reply_markup=CONFIRM_KEYBOARD
+    )
+
+
+def _region_summary(data: dict) -> str:
+    return (
+        f"Назва: {data.get('name', '—')}\n"
+        f"Ціна: {data.get('price', '—')}\n"
+        f"Кількість ділянок: {data.get('plots_number', '—')}\n"
         f"Опис: {data.get('describe') or '—'}\n"
         f"Карта: {data.get('link_map') or '—'}\n"
         f"YouTube: {data.get('link_youtube') or '—'}"
     )
+
+
+# ──────────────────────────────────────
+#  Copy region – enter new value
+# ──────────────────────────────────────
+async def _on_copy_new_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        price = Decimal(update.message.text.strip().replace(",", "."))
+    except InvalidOperation:
+        await update.message.reply_text("Невірний формат. Введіть число:")
+        return
+    context.user_data["new_region"]["price"] = price
     _set_state(context, STATE_IDLE)
+    summary = _region_summary(context.user_data["new_region"])
+    await update.message.reply_text(
+        f"Зберегти?\n\n{summary}", reply_markup=CONFIRM_KEYBOARD
+    )
+
+
+async def _on_copy_new_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["new_region"]["name"] = update.message.text.strip()
+    _set_state(context, STATE_IDLE)
+    summary = _region_summary(context.user_data["new_region"])
     await update.message.reply_text(
         f"Зберегти?\n\n{summary}", reply_markup=CONFIRM_KEYBOARD
     )
