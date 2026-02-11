@@ -1,14 +1,22 @@
 import logging
 
-from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandler
+from telegram.ext import (
+    ApplicationBuilder,
+    CallbackQueryHandler,
+    CommandHandler,
+    MessageHandler,
+    filters,
+)
 
 from bot.config import BOT_TOKEN
 from bot.db import init_db
 from bot.handlers import (
-    build_admin_conversation,
+    admin_callback,
+    cancel,
     help_command,
     region_callback,
     start,
+    text_handler,
 )
 
 logging.basicConfig(
@@ -31,12 +39,12 @@ def main():
         .build()
     )
 
-    # Admin conversation must be added first (higher priority)
-    app.add_handler(build_admin_conversation())
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CallbackQueryHandler(region_callback, pattern="^region_"))
+    app.add_handler(CallbackQueryHandler(admin_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
     logger.info("Bot started")
     app.run_polling()
