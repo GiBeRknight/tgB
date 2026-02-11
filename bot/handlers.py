@@ -122,13 +122,13 @@ async def region_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    labels = {
-        "region_fontanka1": "Фонтанка1",
-        "region_fontanka2": "Фонтанка2",
-        "region_sukhyi_lyman": "Сухий Лиман",
+    messages = {
+        "region_fontanka1": "Усі земельні ділянки у Фонтанці1",
+        "region_fontanka2": "Усі земельні ділянки у Фонтанці2",
+        "region_sukhyi_lyman": "Усі земельні ділянки у Сухому Лимані",
     }
-    region = labels.get(query.data, query.data)
-    await query.edit_message_text(f"Ви обрали: {region}")
+    text = messages.get(query.data, query.data)
+    await query.edit_message_text(text)
 
 
 # ──────────────────────────────────────
