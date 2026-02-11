@@ -204,12 +204,15 @@ async def _handle_admin_edit(query, context):
             "Немає регіонів для редагування.", reply_markup=ADMIN_MENU
         )
         return
-    keyboard = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton(r.name, callback_data=f"editreg_{r.id}")]
-            for r in regions
-        ]
-    )
+    buttons = [
+        [InlineKeyboardButton(
+            f"{r.name} — {r.price}$" if r.price else r.name,
+            callback_data=f"editreg_{r.id}",
+        )]
+        for r in regions
+    ]
+    buttons.append([InlineKeyboardButton("Назад", callback_data="admin_back")])
+    keyboard = InlineKeyboardMarkup(buttons)
     await query.edit_message_text("Оберіть регіон:", reply_markup=keyboard)
 
 
@@ -220,12 +223,12 @@ async def _handle_edit_pick_region(query, context):
     region_id = int(query.data.replace("editreg_", ""))
     context.user_data["edit_region_id"] = region_id
 
-    keyboard = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton(label, callback_data=f"editfield_{field}")]
-            for field, label in FIELD_LABELS.items()
-        ]
-    )
+    buttons = [
+        [InlineKeyboardButton(label, callback_data=f"editfield_{field}")]
+        for field, label in FIELD_LABELS.items()
+    ]
+    buttons.append([InlineKeyboardButton("Назад", callback_data="admin_edit")])
+    keyboard = InlineKeyboardMarkup(buttons)
     await query.edit_message_text(
         "Оберіть поле для редагування:", reply_markup=keyboard
     )
