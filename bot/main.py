@@ -1,11 +1,15 @@
-import asyncio
 import logging
 
 from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandler
 
 from bot.config import BOT_TOKEN
 from bot.db import init_db
-from bot.handlers import help_command, region_callback, start
+from bot.handlers import (
+    build_admin_conversation,
+    help_command,
+    region_callback,
+    start,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -26,6 +30,9 @@ def main():
         .post_init(post_init)
         .build()
     )
+
+    # Admin conversation must be added first (higher priority)
+    app.add_handler(build_admin_conversation())
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))

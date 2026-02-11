@@ -1,6 +1,7 @@
 import os
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")
 
 DB_HOST = os.environ.get("DB_HOST", "db")
 DB_PORT = os.environ.get("DB_PORT", "5432")
