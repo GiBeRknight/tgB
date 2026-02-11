@@ -414,19 +414,15 @@ async def _on_add_plots(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     context.user_data["new_region"]["plots_number"] = plots
     _set_state(context, STATE_ADD_SIZE)
-    await update.message.reply_text("Введіть розмір ділянки (сотки), або /skip (за замовч. 5):")
+    await update.message.reply_text("Введіть розмір ділянки (сотки):")
 
 
 async def _on_add_size(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text == "/skip":
-        context.user_data["new_region"]["size"] = 5
-    else:
-        try:
-            context.user_data["new_region"]["size"] = int(text)
-        except ValueError:
-            await update.message.reply_text("Невірний формат. Введіть ціле число:")
-            return
+    try:
+        context.user_data["new_region"]["size"] = int(update.message.text.strip())
+    except ValueError:
+        await update.message.reply_text("Невірний формат. Введіть ціле число:")
+        return
     _set_state(context, STATE_ADD_DESCRIBE)
     await update.message.reply_text("Введіть опис (або /skip):")
 
