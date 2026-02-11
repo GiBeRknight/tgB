@@ -29,14 +29,20 @@ STATE_COPY_NEW_PRICE = "copy_new_price"
 STATE_COPY_NEW_NAME = "copy_new_name"
 
 # --- Keyboards ---
-START_KEYBOARD = InlineKeyboardMarkup(
-    [
-        [InlineKeyboardButton("Фонтанка1", callback_data="region_fontanka1")],
-        [InlineKeyboardButton("Фонтанка2", callback_data="region_fontanka2")],
-        [InlineKeyboardButton("Сухий Лиман", callback_data="region_sukhyi_lyman")],
-        [InlineKeyboardButton("Увійти як Адмін", callback_data="admin_login")],
+ADMIN_LOGIN_BUTTON = [InlineKeyboardButton("Увійти як Адмін", callback_data="admin_login")]
+
+
+async def _build_start_keyboard() -> InlineKeyboardMarkup:
+    """Build start keyboard with unique region names from DB + admin button."""
+    async with async_session() as session:
+        regions = (await session.execute(select(Region))).scalars().all()
+    unique_names = sorted(set(r.name for r in regions))
+    buttons = [
+        [InlineKeyboardButton(name, callback_data=f"regionname_{name}")]
+        for name in unique_names
     ]
-)
+    buttons.append(ADMIN_LOGIN_BUTTON)
+    return InlineKeyboardMarkup(buttons)
 
 ADMIN_MENU = InlineKeyboardMarkup(
     [
@@ -93,9 +99,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             session.add(user)
             await session.commit()
 
+    keyboard = await _build_start_keyboard()
     await update.message.reply_text(
         "Це бот першої земельної компанії, будь ласка оберіть який регіон вас цікавить",
-        reply_markup=START_KEYBOARD,
+        reply_markup=keyboard,
     )
 
 
@@ -127,14 +134,64 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def region_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    data = query.data
 
-    messages = {
-        "region_fontanka1": "Усі земельні ділянки у Фонтанці1",
-        "region_fontanka2": "Усі земельні ділянки у Фонтанці2",
-        "region_sukhyi_lyman": "Усі земельні ділянки у Сухому Лимані",
-    }
-    text = messages.get(query.data, query.data)
-    await query.edit_message_text(text)
+    if data.startswith("regionname_"):
+        # Show all regions with this name (buttons: name — price$ — size сот.)
+        name = data.replace("regionname_", "", 1)
+        async with async_session() as session:
+            regions = (
+                await session.execute(select(Region).where(Region.name == name))
+            ).scalars().all()
+        if not regions:
+            keyboard = await _build_start_keyboard()
+            await query.edit_message_text(
+                "Немає ділянок у цьому регіоні.", reply_markup=keyboard
+            )
+            return
+        buttons = [
+            [InlineKeyboardButton(
+                f"{r.name} — {r.price}$ — {r.size} сот.",
+                callback_data=f"regiondetail_{r.id}",
+            )]
+            for r in regions
+        ]
+        buttons.append([InlineKeyboardButton("Назад", callback_data="region_back")])
+        await query.edit_message_text(
+            f"Ділянки у «{name}»:", reply_markup=InlineKeyboardMarkup(buttons)
+        )
+
+    elif data.startswith("regiondetail_"):
+        # Show full info about a specific region
+        region_id = int(data.replace("regiondetail_", ""))
+        async with async_session() as session:
+            region = await session.get(Region, region_id)
+        if not region:
+            keyboard = await _build_start_keyboard()
+            await query.edit_message_text(
+                "Регіон не знайдено.", reply_markup=keyboard
+            )
+            return
+        text = (
+            f"Назва: {region.name}\n"
+            f"Ціна: {region.price}$\n"
+            f"Кількість ділянок: {region.plots_number}\n"
+            f"Розмір: {region.size} сот.\n"
+            f"Опис: {region.describe or '—'}\n"
+            f"Карта: {region.link_map or '—'}\n"
+            f"YouTube: {region.link_youtube or '—'}"
+        )
+        back_btn = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("Назад", callback_data=f"regionname_{region.name}")]]
+        )
+        await query.edit_message_text(text, reply_markup=back_btn)
+
+    elif data == "region_back":
+        keyboard = await _build_start_keyboard()
+        await query.edit_message_text(
+            "Це бот першої земельної компанії, будь ласка оберіть який регіон вас цікавить",
+            reply_markup=keyboard,
+        )
 
 
 # ──────────────────────────────────────
@@ -157,9 +214,10 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _handle_admin_edit(query, context)
     elif data == "admin_back":
         _set_state(context, STATE_IDLE)
+        keyboard = await _build_start_keyboard()
         await query.edit_message_text(
             "Це бот першої земельної компанії, будь ласка оберіть який регіон вас цікавить",
-            reply_markup=START_KEYBOARD,
+            reply_markup=keyboard,
         )
     elif data.startswith("copyreg_price_"):
         await _handle_copy_pick(query, context, "price")
