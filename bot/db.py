@@ -39,4 +39,14 @@ async def init_db():
                 await conn.execute(text(stmt))
         except Exception as exc:
             logger.warning("ALTER failed: %s — %s", stmt, exc)
+    # Create index for fast region name lookups
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(
+                text("CREATE INDEX IF NOT EXISTS idx_regions_name ON regions(name)")
+            )
+        logger.info("Index idx_regions_name ensured")
+    except Exception as exc:
+        logger.warning("Index creation failed: %s", exc)
+
     logger.info("Schema migrations applied")
