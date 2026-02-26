@@ -29,6 +29,7 @@ STATE_COPY_NEW_PRICE = "copy_new_price"
 STATE_COPY_NEW_NAME = "copy_new_name"
 STATE_CREATE_REALTOR_NAME = "create_realtor_name"
 STATE_CREATE_REALTOR_PASSWORD = "create_realtor_password"
+STATE_ADD_PHOTO = "add_photo"
 
 # --- Keyboards ---
 
@@ -82,6 +83,7 @@ FIELD_LABELS = {
     "describe": "Опис",
     "link_map": "Посилання на карту",
     "link_youtube": "Посилання на YouTube",
+    "photo_file_id": "Фото",
 }
 
 
@@ -165,12 +167,6 @@ async def region_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             regions = (
                 await session.execute(select(Region).where(Region.name == name))
             ).scalars().all()
-        if not regions:
-            keyboard = await _build_start_keyboard()
-            await query.edit_message_text(
-                "Немає ділянок у цьому регіоні.", reply_markup=keyboard
-            )
-            return
         buttons = [
             [InlineKeyboardButton(
                 f"{r.name} — {r.price}$ — {r.size} сот.",
@@ -179,9 +175,15 @@ async def region_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for r in regions
         ]
         buttons.append([InlineKeyboardButton("Назад", callback_data="region_back")])
-        await query.edit_message_text(
-            f"Ділянки у «{name}»:", reply_markup=InlineKeyboardMarkup(buttons)
-        )
+        reply_markup = InlineKeyboardMarkup(buttons)
+        msg_text = f"Ділянки у «{name}»:" if regions else "Немає ділянок у цьому регіоні."
+        if not regions:
+            reply_markup = await _build_start_keyboard()
+        if query.message.photo:
+            await query.message.delete()
+            await query.message.reply_text(msg_text, reply_markup=reply_markup)
+        else:
+            await query.edit_message_text(msg_text, reply_markup=reply_markup)
 
     elif data.startswith("regiondetail_"):
         # Show full info about a specific region
@@ -190,9 +192,7 @@ async def region_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             region = await session.get(Region, region_id)
         if not region:
             keyboard = await _build_start_keyboard()
-            await query.edit_message_text(
-                "Регіон не знайдено.", reply_markup=keyboard
-            )
+            await query.edit_message_text("Регіон не знайдено.", reply_markup=keyboard)
             return
         text = (
             f"Назва: {region.name}\n"
@@ -206,14 +206,24 @@ async def region_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         back_btn = InlineKeyboardMarkup(
             [[InlineKeyboardButton("Назад", callback_data=f"regionname_{region.name}")]]
         )
-        await query.edit_message_text(text, reply_markup=back_btn)
+        if region.photo_file_id:
+            await query.message.delete()
+            await query.message.reply_photo(
+                photo=region.photo_file_id,
+                caption=text,
+                reply_markup=back_btn,
+            )
+        else:
+            await query.edit_message_text(text, reply_markup=back_btn)
 
     elif data == "region_back":
         keyboard = await _build_start_keyboard()
-        await query.edit_message_text(
-            "Це бот першої земельної компанії, будь ласка оберіть який регіон вас цікавить",
-            reply_markup=keyboard,
-        )
+        msg_text = "Це бот першої земельної компанії, будь ласка оберіть який регіон вас цікавить"
+        if query.message.photo:
+            await query.message.delete()
+            await query.message.reply_text(msg_text, reply_markup=keyboard)
+        else:
+            await query.edit_message_text(msg_text, reply_markup=keyboard)
 
 
 # ──────────────────────────────────────
@@ -378,6 +388,7 @@ async def _handle_copy_pick(query, context, copy_field: str):
             "describe": region.describe,
             "link_map": region.link_map,
             "link_youtube": region.link_youtube,
+            "photo_file_id": region.photo_file_id,
         }
 
     if copy_field == "price":
@@ -411,7 +422,10 @@ async def _handle_edit_pick_field(query, context):
     context.user_data["edit_field"] = field
     label = FIELD_LABELS.get(field, field)
     _set_state(context, STATE_EDIT_VALUE)
-    await query.edit_message_text(f"Введіть нове значення для '{label}':")
+    if field == "photo_file_id":
+        await query.edit_message_text("Надішліть нове фото або введіть /skip щоб видалити поточне:")
+    else:
+        await query.edit_message_text(f"Введіть нове значення для '{label}':")
 
 
 # ──────────────────────────────────────
@@ -446,6 +460,12 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _on_copy_new_price(update, context)
     elif state == STATE_COPY_NEW_NAME:
         await _on_copy_new_name(update, context)
+    elif state == STATE_ADD_PHOTO:
+        # Text during photo step = /skip (or any text → treat as skip)
+        context.user_data["new_region"]["photo_file_id"] = None
+        _set_state(context, STATE_IDLE)
+        summary = _region_summary(context.user_data["new_region"])
+        await update.message.reply_text(f"Зберегти?\n\n{summary}", reply_markup=CONFIRM_KEYBOARD)
     elif state == STATE_CREATE_REALTOR_NAME:
         await _on_create_realtor_name(update, context)
     elif state == STATE_CREATE_REALTOR_PASSWORD:
@@ -568,15 +588,14 @@ async def _on_add_link_map(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _on_add_link_youtube(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     context.user_data["new_region"]["link_youtube"] = None if text == "/skip" else text
-
-    _set_state(context, STATE_IDLE)
-    summary = _region_summary(context.user_data["new_region"])
+    _set_state(context, STATE_ADD_PHOTO)
     await update.message.reply_text(
-        f"Зберегти?\n\n{summary}", reply_markup=CONFIRM_KEYBOARD
+        "Надішліть фото ділянки (PNG/JPG/WebP) або /skip щоб пропустити:"
     )
 
 
 def _region_summary(data: dict) -> str:
+    has_photo = "є" if data.get("photo_file_id") else "немає"
     return (
         f"Назва: {data.get('name', '—')}\n"
         f"Ціна: {data.get('price', '—')}\n"
@@ -584,7 +603,8 @@ def _region_summary(data: dict) -> str:
         f"Розмір (сотки): {data.get('size', 5)}\n"
         f"Опис: {data.get('describe') or '—'}\n"
         f"Карта: {data.get('link_map') or '—'}\n"
-        f"YouTube: {data.get('link_youtube') or '—'}"
+        f"YouTube: {data.get('link_youtube') or '—'}\n"
+        f"Фото: {has_photo}"
     )
 
 
@@ -633,6 +653,14 @@ async def _on_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
             value = int(raw)
         except ValueError:
             await update.message.reply_text("Невірний формат. Введіть ціле число:")
+            return
+    elif field == "photo_file_id":
+        if raw == "/skip":
+            value = None
+        else:
+            await update.message.reply_text(
+                "Надішліть фото або введіть /skip щоб видалити поточне фото:"
+            )
             return
     else:
         value = raw
@@ -684,3 +712,42 @@ async def _on_create_realtor_password(update: Update, context: ContextTypes.DEFA
         f"Ріелтор «{name}» створений.\nПароль: {password}",
         reply_markup=ADMIN_MENU,
     )
+
+
+# ──────────────────────────────────────
+#  Photo message handler
+# ──────────────────────────────────────
+async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    state = _get_state(context)
+    file_id = update.message.photo[-1].file_id  # highest resolution
+
+    if state == STATE_ADD_PHOTO:
+        context.user_data["new_region"]["photo_file_id"] = file_id
+        _set_state(context, STATE_IDLE)
+        summary = _region_summary(context.user_data["new_region"])
+        await update.message.reply_text(
+            f"Зберегти?\n\n{summary}", reply_markup=CONFIRM_KEYBOARD
+        )
+        return
+
+    if state == STATE_EDIT_VALUE and context.user_data.get("edit_field") == "photo_file_id":
+        region_id = context.user_data.get("edit_region_id")
+        tg_user = update.effective_user
+        async with async_session() as session:
+            region = await session.get(Region, region_id)
+            if region:
+                region.photo_file_id = file_id
+                await session.commit()
+                await _log_action(
+                    tg_user.id,
+                    tg_user.username,
+                    f"Змінив фото регіону «{region.name}»",
+                )
+                await update.message.reply_text("Фото оновлено!", reply_markup=_get_menu(context))
+            else:
+                await update.message.reply_text(
+                    "Регіон не знайдено.", reply_markup=_get_menu(context)
+                )
+        _set_state(context, STATE_IDLE)
+        context.user_data.pop("edit_field", None)
+        context.user_data.pop("edit_region_id", None)
