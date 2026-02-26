@@ -15,6 +15,7 @@ from bot.config import BOT_TOKEN
 from bot.db import init_db
 from bot.handlers import (
     admin_callback,
+    admin_command,
     cancel,
     help_command,
     region_callback,
@@ -59,6 +60,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("cancel", cancel))
+    app.add_handler(CommandHandler("admin", admin_command))
     app.add_handler(CallbackQueryHandler(region_callback, pattern="^region"))
     app.add_handler(CallbackQueryHandler(admin_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))

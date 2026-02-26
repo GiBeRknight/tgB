@@ -29,11 +29,10 @@ STATE_COPY_NEW_PRICE = "copy_new_price"
 STATE_COPY_NEW_NAME = "copy_new_name"
 
 # --- Keyboards ---
-ADMIN_LOGIN_BUTTON = [InlineKeyboardButton("Увійти як Адмін", callback_data="admin_login")]
 
 
 async def _build_start_keyboard() -> InlineKeyboardMarkup:
-    """Build start keyboard with unique region names from DB + admin button."""
+    """Build start keyboard with unique region names from DB."""
     async with async_session() as session:
         regions = (await session.execute(select(Region))).scalars().all()
     unique_names = sorted(set(r.name for r in regions))
@@ -41,7 +40,6 @@ async def _build_start_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(name, callback_data=f"regionname_{name}")]
         for name in unique_names
     ]
-    buttons.append(ADMIN_LOGIN_BUTTON)
     return InlineKeyboardMarkup(buttons)
 
 ADMIN_MENU = InlineKeyboardMarkup(
@@ -202,9 +200,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
 
-    if data == "admin_login":
-        await _handle_admin_login(query, context)
-    elif data == "admin_add":
+    if data == "admin_add":
         await _handle_admin_add(query, context)
     elif data == "admin_copy_price":
         await _handle_copy_list(query, context, "price")
@@ -232,19 +228,20 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ──────────────────────────────────────
-#  Admin login
+#  /admin command
 # ──────────────────────────────────────
-async def _handle_admin_login(query, context):
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tg_user = update.effective_user
     async with async_session() as session:
-        user = await session.get(User, query.from_user.id)
+        user = await session.get(User, tg_user.id)
         if user and user.is_admin:
-            await query.edit_message_text(
-                "Ви вже адміністратор.", reply_markup=ADMIN_MENU
+            await update.message.reply_text(
+                "Панель адміністратора:", reply_markup=ADMIN_MENU
             )
             return
 
     _set_state(context, STATE_LOGIN_PASSWORD)
-    await query.edit_message_text("Введіть пароль адміністратора:")
+    await update.message.reply_text("Введіть пароль адміністратора:")
 
 
 # ──────────────────────────────────────
