@@ -817,7 +817,12 @@ async def _on_create_realtor_password(update: Update, context: ContextTypes.DEFA
 # ──────────────────────────────────────
 async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = _get_state(context)
-    file_id = update.message.photo[-1].file_id  # highest resolution
+    if update.message.photo:
+        file_id = update.message.photo[-1].file_id
+    elif update.message.document:
+        file_id = update.message.document.file_id
+    else:
+        return
 
     if state == STATE_ADD_PHOTO:
         photos = context.user_data.setdefault("new_region_photos", [])

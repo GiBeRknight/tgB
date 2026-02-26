@@ -64,7 +64,7 @@ def main():
     app.add_handler(CommandHandler("admin", admin_command))
     app.add_handler(CallbackQueryHandler(region_callback, pattern="^region"))
     app.add_handler(CallbackQueryHandler(admin_callback))
-    app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, photo_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
     app.add_error_handler(error_handler)
