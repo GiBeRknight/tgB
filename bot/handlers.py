@@ -1,6 +1,6 @@
 from decimal import Decimal, InvalidOperation
 
-from sqlalchemy import delete, select
+from sqlalchemy import select
 from telegram import InputMediaPhoto, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     CallbackQueryHandler,
@@ -30,7 +30,7 @@ STATE_COPY_NEW_NAME = "copy_new_name"
 STATE_CREATE_REALTOR_NAME = "create_realtor_name"
 STATE_CREATE_REALTOR_PASSWORD = "create_realtor_password"
 STATE_ADD_PHOTO = "add_photo"
-STATE_EDIT_PHOTOS = "edit_photos"
+STATE_EDIT_ADD_PHOTO = "edit_add_photo"
 
 # --- Keyboards ---
 
@@ -151,7 +151,6 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("new_region_photos", None)
     context.user_data.pop("edit_region_id", None)
     context.user_data.pop("edit_field", None)
-    context.user_data.pop("edit_photos", None)
     await update.message.reply_text("Скасовано. Натисніть /start щоб почати знову.")
 
 
@@ -272,6 +271,28 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _handle_edit_pick_field(query, context)
     elif data in ("confirm_yes", "confirm_no"):
         await _handle_add_confirm(query, context)
+    elif data == "addphoto_done":
+        _set_state(context, STATE_IDLE)
+        photos = context.user_data.get("new_region_photos", [])
+        summary = _region_summary(context.user_data.get("new_region", {}), photos)
+        await query.edit_message_text(f"Зберегти?\n\n{summary}", reply_markup=CONFIRM_KEYBOARD)
+    elif data.startswith("photomgr_"):
+        region_id = int(data.replace("photomgr_", ""))
+        _set_state(context, STATE_IDLE)
+        text, kb = await _photo_mgmt(region_id, context)
+        await query.edit_message_text(text, reply_markup=kb)
+    elif data.startswith("photodel_"):
+        await _handle_photodel(query, context)
+    elif data.startswith("photoadd_"):
+        region_id = int(data.replace("photoadd_", ""))
+        context.user_data["edit_region_id"] = region_id
+        _set_state(context, STATE_EDIT_ADD_PHOTO)
+        done_kb = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("✅ Готово", callback_data=f"photomgr_{region_id}")]]
+        )
+        await query.edit_message_text(
+            "Надішліть фото (PNG/JPG/WebP), можна кілька по одному:", reply_markup=done_kb
+        )
 
 
 # ──────────────────────────────────────
@@ -418,6 +439,49 @@ async def _handle_copy_pick(query, context, copy_field: str):
 
 
 # ──────────────────────────────────────
+#  Photo management helpers
+# ──────────────────────────────────────
+async def _photo_mgmt(region_id: int, context) -> tuple:
+    """Return (text, keyboard) for the photo management menu."""
+    async with async_session() as session:
+        result = await session.execute(
+            select(RegionPhoto)
+            .where(RegionPhoto.region_id == region_id)
+            .order_by(RegionPhoto.position)
+        )
+        photos = result.scalars().all()
+        rows = [
+            [InlineKeyboardButton(f"❌ Фото {i + 1}", callback_data=f"photodel_{p.id}")]
+            for i, p in enumerate(photos)
+        ]
+    rows.append([InlineKeyboardButton("➕ Додати фото", callback_data=f"photoadd_{region_id}")])
+    region_id_stored = context.user_data.get("edit_region_id", region_id)
+    rows.append([InlineKeyboardButton("← Назад", callback_data=f"editreg_{region_id_stored}")])
+    count = len(photos)
+    text = f"Фото ділянки ({count} шт.):" if count else "Фото немає."
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def _handle_photodel(query, context):
+    photo_id = int(query.data.replace("photodel_", ""))
+    async with async_session() as session:
+        photo = await session.get(RegionPhoto, photo_id)
+        if not photo:
+            await query.answer("Фото вже видалено.")
+            return
+        region_id = photo.region_id
+        await session.delete(photo)
+        await session.commit()
+    await _log_action(
+        query.from_user.id,
+        query.from_user.username,
+        f"Видалив фото #{photo_id} регіону #{region_id}",
+    )
+    text, kb = await _photo_mgmt(region_id, context)
+    await query.edit_message_text(text, reply_markup=kb)
+
+
+# ──────────────────────────────────────
 #  Edit region callbacks
 # ──────────────────────────────────────
 async def _handle_edit_pick_region(query, context):
@@ -440,12 +504,10 @@ async def _handle_edit_pick_field(query, context):
     context.user_data["edit_field"] = field
     label = FIELD_LABELS.get(field, field)
     if field == "photo_file_id":
-        context.user_data.pop("edit_photos", None)
-        _set_state(context, STATE_EDIT_PHOTOS)
-        await query.edit_message_text(
-            "Надішліть нові фото (одне за раз).\n"
-            "Введіть /done щоб зберегти або /skip щоб видалити всі фото:"
-        )
+        region_id = context.user_data.get("edit_region_id")
+        text, kb = await _photo_mgmt(region_id, context)
+        await query.edit_message_text(text, reply_markup=kb)
+        return
     else:
         _set_state(context, STATE_EDIT_VALUE)
         await query.edit_message_text(f"Введіть нове значення для '{label}':")
@@ -489,13 +551,20 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif state == STATE_COPY_NEW_NAME:
         await _on_copy_new_name(update, context)
     elif state == STATE_ADD_PHOTO:
-        # Any text finishes photo collection; already collected photos are kept
-        _set_state(context, STATE_IDLE)
-        photos = context.user_data.get("new_region_photos", [])
-        summary = _region_summary(context.user_data["new_region"], photos)
-        await update.message.reply_text(f"Зберегти?\n\n{summary}", reply_markup=CONFIRM_KEYBOARD)
-    elif state == STATE_EDIT_PHOTOS:
-        await _on_edit_photos_done(update, context)
+        done_kb = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("✅ Готово", callback_data="addphoto_done")]]
+        )
+        await update.message.reply_text(
+            "Надішліть фото або натисніть кнопку:", reply_markup=done_kb
+        )
+    elif state == STATE_EDIT_ADD_PHOTO:
+        region_id = context.user_data.get("edit_region_id")
+        done_kb = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("✅ Готово", callback_data=f"photomgr_{region_id}")]]
+        )
+        await update.message.reply_text(
+            "Надішліть фото або натисніть кнопку:", reply_markup=done_kb
+        )
     elif state == STATE_CREATE_REALTOR_NAME:
         await _on_create_realtor_name(update, context)
     elif state == STATE_CREATE_REALTOR_PASSWORD:
@@ -619,9 +688,12 @@ async def _on_add_link_youtube(update: Update, context: ContextTypes.DEFAULT_TYP
     text = update.message.text.strip()
     context.user_data["new_region"]["link_youtube"] = None if text == "/skip" else text
     _set_state(context, STATE_ADD_PHOTO)
+    skip_kb = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("⏩ Пропустити / Готово", callback_data="addphoto_done")]]
+    )
     await update.message.reply_text(
-        "Надішліть фото ділянки (PNG/JPG/WebP), можна кілька по одному.\n"
-        "Введіть /done щоб завершити або /skip щоб пропустити фото:"
+        "Надішліть фото ділянки (PNG/JPG/WebP), можна кілька по одному:",
+        reply_markup=skip_kb,
     )
 
 
@@ -750,52 +822,37 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if state == STATE_ADD_PHOTO:
         photos = context.user_data.setdefault("new_region_photos", [])
         photos.append(file_id)
+        done_kb = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("✅ Готово", callback_data="addphoto_done")]]
+        )
         await update.message.reply_text(
-            f"Фото {len(photos)} отримано! Надішліть ще або введіть /done щоб завершити:"
+            f"Фото {len(photos)} отримано! Надішліть ще або:", reply_markup=done_kb
         )
         return
 
-    if state == STATE_EDIT_PHOTOS:
-        photos = context.user_data.setdefault("edit_photos", [])
-        photos.append(file_id)
+    if state == STATE_EDIT_ADD_PHOTO:
+        region_id = context.user_data.get("edit_region_id")
+        async with async_session() as session:
+            result = await session.execute(
+                select(RegionPhoto)
+                .where(RegionPhoto.region_id == region_id)
+                .order_by(RegionPhoto.position.desc())
+            )
+            last = result.scalars().first()
+            next_pos = (last.position + 1) if last else 0
+            session.add(RegionPhoto(region_id=region_id, file_id=file_id, position=next_pos))
+            await session.commit()
+        await _log_action(
+            update.effective_user.id,
+            update.effective_user.username,
+            f"Додав фото до регіону #{region_id}",
+        )
+        done_kb = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("✅ Готово", callback_data=f"photomgr_{region_id}")]]
+        )
         await update.message.reply_text(
-            f"Фото {len(photos)} отримано! Надішліть ще або /done щоб зберегти:"
+            "Фото збережено! Надішліть ще або:", reply_markup=done_kb
         )
         return
 
 
-# ──────────────────────────────────────
-#  Edit photos done
-# ──────────────────────────────────────
-async def _on_edit_photos_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    raw = update.message.text.strip()
-    region_id = context.user_data.get("edit_region_id")
-    tg_user = update.effective_user
-
-    if raw == "/skip":
-        new_photos = []
-    else:
-        # /done or any text = use collected photos
-        new_photos = context.user_data.pop("edit_photos", [])
-
-    async with async_session() as session:
-        await session.execute(
-            delete(RegionPhoto).where(RegionPhoto.region_id == region_id)
-        )
-        for i, fid in enumerate(new_photos):
-            session.add(RegionPhoto(region_id=region_id, file_id=fid, position=i))
-        await session.commit()
-
-    action = (
-        f"Оновив фото регіону #{region_id} ({len(new_photos)} шт.)"
-        if new_photos
-        else f"Видалив всі фото регіону #{region_id}"
-    )
-    await _log_action(tg_user.id, tg_user.username, action)
-
-    _set_state(context, STATE_IDLE)
-    context.user_data.pop("edit_field", None)
-    context.user_data.pop("edit_region_id", None)
-
-    msg = f"Фото оновлено ({len(new_photos)} шт.)!" if new_photos else "Всі фото видалено."
-    await update.message.reply_text(msg, reply_markup=_get_menu(context))
