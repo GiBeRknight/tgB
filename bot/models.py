@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Integer, Numeric, String, Text
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, Numeric, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -56,4 +56,14 @@ class Region(Base):
     link_map: Mapped[str | None] = mapped_column(String(500), nullable=True)
     size: Mapped[int] = mapped_column(Integer, default=5)
     link_youtube: Mapped[str | None] = mapped_column(String(500), nullable=True)
-    photo_file_id: Mapped[str | None] = mapped_column(String(500), nullable=True)
+
+
+class RegionPhoto(Base):
+    __tablename__ = "region_photos"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    region_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("regions.id", ondelete="CASCADE")
+    )
+    file_id: Mapped[str] = mapped_column(String(500))
+    position: Mapped[int] = mapped_column(Integer, default=0)
