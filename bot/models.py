@@ -66,4 +66,5 @@ class RegionPhoto(Base):
         Integer, ForeignKey("regions.id", ondelete="CASCADE")
     )
     file_id: Mapped[str] = mapped_column(String(500))
+    file_type: Mapped[str] = mapped_column(String(20), default="photo")
     position: Mapped[int] = mapped_column(Integer, default=0)
