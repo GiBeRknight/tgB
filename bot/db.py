@@ -33,6 +33,7 @@ async def init_db():
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN DEFAULT FALSE",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_realtor BOOLEAN DEFAULT FALSE",
         "ALTER TABLE regions ADD COLUMN IF NOT EXISTS size INTEGER DEFAULT 5",
+        "ALTER TABLE regions ADD COLUMN IF NOT EXISTS photo_file_id VARCHAR(500) DEFAULT NULL",
     ]
     for stmt in alter_statements:
         try:
