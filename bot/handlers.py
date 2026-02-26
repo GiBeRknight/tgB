@@ -214,22 +214,18 @@ async def region_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         back_btn = InlineKeyboardMarkup(
             [[InlineKeyboardButton("Назад", callback_data=f"regionname_{region.name}")]]
         )
+        chat_id = query.message.chat_id
         await query.message.delete()
-        if not photos:
-            await query.message.reply_text(text, reply_markup=back_btn)
-        elif len(photos) == 1:
-            p = photos[0]
+        # Text with info and back button always comes first
+        await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=back_btn)
+        # Photos below the text; documents are re-downloaded and sent as photos
+        for p in photos:
             if p.file_type == "photo":
-                await query.message.reply_photo(photo=p.file_id, caption=text, reply_markup=back_btn)
+                await context.bot.send_photo(chat_id=chat_id, photo=p.file_id)
             else:
-                await query.message.reply_document(document=p.file_id, caption=text, reply_markup=back_btn)
-        else:
-            for p in photos:
-                if p.file_type == "photo":
-                    await query.message.reply_photo(photo=p.file_id)
-                else:
-                    await query.message.reply_document(document=p.file_id)
-            await query.message.reply_text(text, reply_markup=back_btn)
+                tg_file = await context.bot.get_file(p.file_id)
+                file_bytes = await tg_file.download_as_bytearray()
+                await context.bot.send_photo(chat_id=chat_id, photo=bytes(file_bytes))
 
     elif data == "region_back":
         keyboard = await _build_start_keyboard()
