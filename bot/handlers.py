@@ -12,7 +12,7 @@ from telegram.ext import (
 
 from bot.config import ADMIN_PASSWORD
 from bot.db import async_session
-from bot.models import Region, User
+from bot.models import ActionLog, Realtor, Region, User
 
 # --- Manual state constants ---
 STATE_IDLE = "idle"
@@ -27,6 +27,8 @@ STATE_ADD_LINK_YOUTUBE = "add_link_youtube"
 STATE_EDIT_VALUE = "edit_value"
 STATE_COPY_NEW_PRICE = "copy_new_price"
 STATE_COPY_NEW_NAME = "copy_new_name"
+STATE_CREATE_REALTOR_NAME = "create_realtor_name"
+STATE_CREATE_REALTOR_PASSWORD = "create_realtor_password"
 
 # --- Keyboards ---
 
@@ -43,6 +45,17 @@ async def _build_start_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(buttons)
 
 ADMIN_MENU = InlineKeyboardMarkup(
+    [
+        [InlineKeyboardButton("Додати новий", callback_data="admin_add")],
+        [InlineKeyboardButton("Копіювати з новою ціною", callback_data="admin_copy_price")],
+        [InlineKeyboardButton("Копіювати з новим ім'ям", callback_data="admin_copy_name")],
+        [InlineKeyboardButton("Редагувати", callback_data="admin_edit")],
+        [InlineKeyboardButton("Створити ріелтора", callback_data="admin_create_realtor")],
+        [InlineKeyboardButton("Назад", callback_data="admin_back")],
+    ]
+)
+
+REALTOR_MENU = InlineKeyboardMarkup(
     [
         [InlineKeyboardButton("Додати новий", callback_data="admin_add")],
         [InlineKeyboardButton("Копіювати з новою ціною", callback_data="admin_copy_price")],
@@ -78,6 +91,17 @@ def _get_state(context: ContextTypes.DEFAULT_TYPE) -> str:
 
 def _set_state(context: ContextTypes.DEFAULT_TYPE, state: str):
     context.user_data["state"] = state
+
+
+def _get_menu(context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
+    return ADMIN_MENU if context.user_data.get("role") == "admin" else REALTOR_MENU
+
+
+async def _log_action(user_id: int, username: str | None, action: str):
+    async with async_session() as session:
+        log = ActionLog(user_id=user_id, username=username, action=action)
+        session.add(log)
+        await session.commit()
 
 
 # ──────────────────────────────────────
@@ -208,6 +232,8 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _handle_copy_list(query, context, "name")
     elif data == "admin_edit":
         await _handle_admin_edit(query, context)
+    elif data == "admin_create_realtor":
+        await _handle_create_realtor(query, context)
     elif data == "admin_back":
         _set_state(context, STATE_IDLE)
         keyboard = await _build_start_keyboard()
@@ -228,6 +254,20 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ──────────────────────────────────────
+#  Create realtor
+# ──────────────────────────────────────
+async def _handle_create_realtor(query, context):
+    async with async_session() as session:
+        user = await session.get(User, query.from_user.id)
+        if not user or not user.is_admin:
+            await query.edit_message_text("Тільки адміністратор може створювати ріелторів.")
+            return
+
+    _set_state(context, STATE_CREATE_REALTOR_NAME)
+    await query.edit_message_text("Введіть ім'я ріелтора:")
+
+
+# ──────────────────────────────────────
 #  /admin command
 # ──────────────────────────────────────
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -235,13 +275,16 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with async_session() as session:
         user = await session.get(User, tg_user.id)
         if user and user.is_admin:
-            await update.message.reply_text(
-                "Панель адміністратора:", reply_markup=ADMIN_MENU
-            )
+            context.user_data["role"] = "admin"
+            await update.message.reply_text("Панель адміністратора:", reply_markup=ADMIN_MENU)
+            return
+        if user and user.is_realtor:
+            context.user_data["role"] = "realtor"
+            await update.message.reply_text("Панель ріелтора:", reply_markup=REALTOR_MENU)
             return
 
     _set_state(context, STATE_LOGIN_PASSWORD)
-    await update.message.reply_text("Введіть пароль адміністратора:")
+    await update.message.reply_text("Введіть пароль:")
 
 
 # ──────────────────────────────────────
@@ -250,7 +293,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _handle_admin_add(query, context):
     async with async_session() as session:
         user = await session.get(User, query.from_user.id)
-        if not user or not user.is_admin:
+        if not user or (not user.is_admin and not user.is_realtor):
             await query.edit_message_text("У вас немає прав адміністратора.")
             return
 
@@ -262,7 +305,7 @@ async def _handle_admin_add(query, context):
 async def _handle_admin_edit(query, context):
     async with async_session() as session:
         user = await session.get(User, query.from_user.id)
-        if not user or not user.is_admin:
+        if not user or (not user.is_admin and not user.is_realtor):
             await query.edit_message_text("У вас немає прав адміністратора.")
             return
 
@@ -270,7 +313,7 @@ async def _handle_admin_edit(query, context):
         regions = (await session.execute(select(Region))).scalars().all()
     if not regions:
         await query.edit_message_text(
-            "Немає регіонів для редагування.", reply_markup=ADMIN_MENU
+            "Немає регіонів для редагування.", reply_markup=_get_menu(context)
         )
         return
     buttons = [
@@ -291,7 +334,7 @@ async def _handle_admin_edit(query, context):
 async def _handle_copy_list(query, context, copy_field: str):
     async with async_session() as session:
         user = await session.get(User, query.from_user.id)
-        if not user or not user.is_admin:
+        if not user or (not user.is_admin and not user.is_realtor):
             await query.edit_message_text("У вас немає прав адміністратора.")
             return
 
@@ -299,7 +342,7 @@ async def _handle_copy_list(query, context, copy_field: str):
         regions = (await session.execute(select(Region))).scalars().all()
     if not regions:
         await query.edit_message_text(
-            "Немає регіонів для копіювання.", reply_markup=ADMIN_MENU
+            "Немає регіонів для копіювання.", reply_markup=_get_menu(context)
         )
         return
     buttons = [
@@ -325,7 +368,7 @@ async def _handle_copy_pick(query, context, copy_field: str):
     async with async_session() as session:
         region = await session.get(Region, region_id)
         if not region:
-            await query.edit_message_text("Регіон не знайдено.", reply_markup=ADMIN_MENU)
+            await query.edit_message_text("Регіон не знайдено.", reply_markup=_get_menu(context))
             return
         context.user_data["new_region"] = {
             "name": region.name,
@@ -381,10 +424,15 @@ async def _handle_add_confirm(query, context):
         async with async_session() as session:
             session.add(region)
             await session.commit()
-        await query.edit_message_text("Регіон збережено!", reply_markup=ADMIN_MENU)
+        await _log_action(
+            query.from_user.id,
+            query.from_user.username,
+            f"Зберіг регіон «{region.name}»",
+        )
+        await query.edit_message_text("Регіон збережено!", reply_markup=_get_menu(context))
     else:
         context.user_data.pop("new_region", None)
-        await query.edit_message_text("Скасовано.", reply_markup=ADMIN_MENU)
+        await query.edit_message_text("Скасовано.", reply_markup=_get_menu(context))
     _set_state(context, STATE_IDLE)
 
 
@@ -398,6 +446,10 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _on_copy_new_price(update, context)
     elif state == STATE_COPY_NEW_NAME:
         await _on_copy_new_name(update, context)
+    elif state == STATE_CREATE_REALTOR_NAME:
+        await _on_create_realtor_name(update, context)
+    elif state == STATE_CREATE_REALTOR_PASSWORD:
+        await _on_create_realtor_password(update, context)
     elif state == STATE_LOGIN_PASSWORD:
         await _on_login_password(update, context)
     elif state == STATE_ADD_NAME:
@@ -423,22 +475,39 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ──────────────────────────────────────
 async def _on_login_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
     password = update.message.text.strip()
+    tg_user = update.effective_user
 
-    if password != ADMIN_PASSWORD:
+    if password == ADMIN_PASSWORD:
+        async with async_session() as session:
+            user = await session.get(User, tg_user.id)
+            if user:
+                user.is_admin = True
+                await session.commit()
         _set_state(context, STATE_IDLE)
-        await update.message.reply_text(
-            "Невірний пароль. Спробуйте /start щоб почати знову."
-        )
+        context.user_data["role"] = "admin"
+        await _log_action(tg_user.id, tg_user.username, "Увійшов як адмін")
+        await update.message.reply_text("Ви увійшли як адмін.", reply_markup=ADMIN_MENU)
         return
 
     async with async_session() as session:
-        user = await session.get(User, update.effective_user.id)
-        if user:
-            user.is_admin = True
-            await session.commit()
+        realtors = (await session.execute(select(Realtor))).scalars().all()
+    matched = next((r for r in realtors if r.password == password), None)
+    if matched:
+        async with async_session() as session:
+            user = await session.get(User, tg_user.id)
+            if user:
+                user.is_realtor = True
+                await session.commit()
+        _set_state(context, STATE_IDLE)
+        context.user_data["role"] = "realtor"
+        await _log_action(tg_user.id, tg_user.username, f"Увійшов як ріелтор «{matched.name}»")
+        await update.message.reply_text(
+            f"Ви увійшли як ріелтор «{matched.name}».", reply_markup=REALTOR_MENU
+        )
+        return
 
     _set_state(context, STATE_IDLE)
-    await update.message.reply_text("Ви увійшли як адмін.", reply_markup=ADMIN_MENU)
+    await update.message.reply_text("Невірний пароль. Спробуйте /admin щоб спробувати знову.")
 
 
 # ──────────────────────────────────────
@@ -568,17 +637,50 @@ async def _on_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         value = raw
 
+    tg_user = update.effective_user
     async with async_session() as session:
         region = await session.get(Region, region_id)
         if region:
             setattr(region, field, value)
             await session.commit()
-            await update.message.reply_text("Оновлено!", reply_markup=ADMIN_MENU)
+            await _log_action(
+                tg_user.id,
+                tg_user.username,
+                f"Відредагував поле «{field}» регіону «{region.name}»",
+            )
+            await update.message.reply_text("Оновлено!", reply_markup=_get_menu(context))
         else:
             await update.message.reply_text(
-                "Регіон не знайдено.", reply_markup=ADMIN_MENU
+                "Регіон не знайдено.", reply_markup=_get_menu(context)
             )
 
     _set_state(context, STATE_IDLE)
     context.user_data.pop("edit_field", None)
     context.user_data.pop("edit_region_id", None)
+
+
+# ──────────────────────────────────────
+#  Create realtor steps
+# ──────────────────────────────────────
+async def _on_create_realtor_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["new_realtor_name"] = update.message.text.strip()
+    _set_state(context, STATE_CREATE_REALTOR_PASSWORD)
+    await update.message.reply_text("Введіть пароль для ріелтора:")
+
+
+async def _on_create_realtor_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = context.user_data.pop("new_realtor_name", "")
+    password = update.message.text.strip()
+    tg_user = update.effective_user
+
+    async with async_session() as session:
+        realtor = Realtor(name=name, password=password, created_by=tg_user.id)
+        session.add(realtor)
+        await session.commit()
+
+    _set_state(context, STATE_IDLE)
+    await _log_action(tg_user.id, tg_user.username, f"Створив ріелтора «{name}»")
+    await update.message.reply_text(
+        f"Ріелтор «{name}» створений.\nПароль: {password}",
+        reply_markup=ADMIN_MENU,
+    )

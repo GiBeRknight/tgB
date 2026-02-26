@@ -31,6 +31,7 @@ async def init_db():
     # Add missing columns (create_all won't alter existing tables)
     alter_statements = [
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_realtor BOOLEAN DEFAULT FALSE",
         "ALTER TABLE regions ADD COLUMN IF NOT EXISTS size INTEGER DEFAULT 5",
     ]
     for stmt in alter_statements:
