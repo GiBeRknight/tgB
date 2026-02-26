@@ -1,7 +1,7 @@
 from decimal import Decimal, InvalidOperation
 
 from sqlalchemy import select
-from telegram import InputMediaPhoto, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InputMediaDocument, InputMediaPhoto, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
@@ -201,7 +201,7 @@ async def region_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 .where(RegionPhoto.region_id == region_id)
                 .order_by(RegionPhoto.position)
             )
-            photo_ids = [p.file_id for p in photos_result.scalars().all()]
+            photos = photos_result.scalars().all()
         text = (
             f"Назва: {region.name}\n"
             f"Ціна: {region.price}$\n"
@@ -215,14 +215,19 @@ async def region_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [[InlineKeyboardButton("Назад", callback_data=f"regionname_{region.name}")]]
         )
         await query.message.delete()
-        if not photo_ids:
+        if not photos:
             await query.message.reply_text(text, reply_markup=back_btn)
-        elif len(photo_ids) == 1:
-            await query.message.reply_photo(
-                photo=photo_ids[0], caption=text, reply_markup=back_btn
-            )
+        elif len(photos) == 1:
+            p = photos[0]
+            if p.file_type == "photo":
+                await query.message.reply_photo(photo=p.file_id, caption=text, reply_markup=back_btn)
+            else:
+                await query.message.reply_document(document=p.file_id, caption=text, reply_markup=back_btn)
         else:
-            media = [InputMediaPhoto(fid) for fid in photo_ids]
+            media = [
+                InputMediaPhoto(p.file_id) if p.file_type == "photo" else InputMediaDocument(p.file_id)
+                for p in photos
+            ]
             await query.message.reply_media_group(media=media)
             await query.message.reply_text(text, reply_markup=back_btn)
 
@@ -418,7 +423,7 @@ async def _handle_copy_pick(query, context, copy_field: str):
             .where(RegionPhoto.region_id == region_id)
             .order_by(RegionPhoto.position)
         )
-        photo_ids = [p.file_id for p in photos_result.scalars().all()]
+        photo_ids = [(p.file_id, p.file_type) for p in photos_result.scalars().all()]
         context.user_data["new_region"] = {
             "name": region.name,
             "price": region.price,
@@ -524,8 +529,8 @@ async def _handle_add_confirm(query, context):
         async with async_session() as session:
             session.add(region)
             await session.flush()  # populate region.id
-            for i, fid in enumerate(photos):
-                session.add(RegionPhoto(region_id=region.id, file_id=fid, position=i))
+            for i, (fid, ftype) in enumerate(photos):
+                session.add(RegionPhoto(region_id=region.id, file_id=fid, file_type=ftype, position=i))
             await session.commit()
         await _log_action(
             query.from_user.id,
@@ -819,14 +824,16 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = _get_state(context)
     if update.message.photo:
         file_id = update.message.photo[-1].file_id
+        file_type = "photo"
     elif update.message.document:
         file_id = update.message.document.file_id
+        file_type = "document"
     else:
         return
 
     if state == STATE_ADD_PHOTO:
         photos = context.user_data.setdefault("new_region_photos", [])
-        photos.append(file_id)
+        photos.append((file_id, file_type))
         done_kb = InlineKeyboardMarkup(
             [[InlineKeyboardButton("✅ Готово", callback_data="addphoto_done")]]
         )
@@ -845,7 +852,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             last = result.scalars().first()
             next_pos = (last.position + 1) if last else 0
-            session.add(RegionPhoto(region_id=region_id, file_id=file_id, position=next_pos))
+            session.add(RegionPhoto(region_id=region_id, file_id=file_id, file_type=file_type, position=next_pos))
             await session.commit()
         await _log_action(
             update.effective_user.id,
