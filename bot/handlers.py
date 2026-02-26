@@ -1,7 +1,7 @@
 from decimal import Decimal, InvalidOperation
 
 from sqlalchemy import select
-from telegram import InputMediaDocument, InputMediaPhoto, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
@@ -224,11 +224,11 @@ async def region_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await query.message.reply_document(document=p.file_id, caption=text, reply_markup=back_btn)
         else:
-            media = [
-                InputMediaPhoto(p.file_id) if p.file_type == "photo" else InputMediaDocument(p.file_id)
-                for p in photos
-            ]
-            await query.message.reply_media_group(media=media)
+            for p in photos:
+                if p.file_type == "photo":
+                    await query.message.reply_photo(photo=p.file_id)
+                else:
+                    await query.message.reply_document(document=p.file_id)
             await query.message.reply_text(text, reply_markup=back_btn)
 
     elif data == "region_back":
