@@ -215,7 +215,7 @@ async def region_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             photos = photos_result.scalars().all()
         text = (
             f"Назва: {region.name}\n"
-            f"Ціна: {region.price}$\n"
+            f"Ціна за сотку: {region.price}$\n"
             f"Кількість ділянок: {region.plots_number}\n"
             f"Розмір: {region.size} сот.\n"
             f"Опис: {region.describe or '—'}\n"
