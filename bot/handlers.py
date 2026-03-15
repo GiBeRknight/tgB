@@ -225,9 +225,10 @@ async def region_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{map_line}\n"
             f"{yt_line}"
         )
-        back_btn = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("Назад", callback_data=f"regionname_{region.name}")]]
-        )
+        nav_btn = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Назад", callback_data=f"regionname_{region.name}"),
+             InlineKeyboardButton("Головна", callback_data="region_back")],
+        ])
         chat_id = query.message.chat_id
         await query.message.delete()
 
@@ -258,7 +259,7 @@ async def region_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 caption="Фото-схема ділянки",
             )
 
-        await context.bot.send_message(chat_id=chat_id, text="\u2800", reply_markup=back_btn)
+        await context.bot.send_message(chat_id=chat_id, text="Оберіть дію:", reply_markup=nav_btn)
 
     elif data == "region_back":
         keyboard = await _build_start_keyboard()
