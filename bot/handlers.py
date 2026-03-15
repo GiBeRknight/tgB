@@ -1,7 +1,7 @@
 from decimal import Decimal, InvalidOperation
 
 from sqlalchemy import select
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
@@ -76,6 +76,11 @@ CONFIRM_KEYBOARD = InlineKeyboardMarkup(
     ]
 )
 
+DEFAULT_NAV_KEYBOARD = ReplyKeyboardMarkup(
+    [["Головна сторінка", "Контакти"]],
+    resize_keyboard=True,
+)
+
 FIELD_LABELS = {
     "name": "Назва",
     "price": "Ціна",
@@ -124,9 +129,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             session.add(user)
             await session.commit()
 
+    # Send persistent navigation buttons
+    await update.message.reply_text(
+        "Вітаємо! Це бот першої земельної компанії.",
+        reply_markup=DEFAULT_NAV_KEYBOARD,
+    )
+
     keyboard = await _build_start_keyboard()
     await update.message.reply_text(
-        "Це бот першої земельної компанії, будь ласка оберіть який регіон вас цікавить",
+        "Будь ласка оберіть який регіон вас цікавить",
         reply_markup=keyboard,
     )
 
@@ -545,6 +556,25 @@ async def _handle_add_confirm(query, context):
 #  Text message router (state machine)
 # ──────────────────────────────────────
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+
+    # --- Default navigation buttons ---
+    if text == "Головна сторінка":
+        _set_state(context, STATE_IDLE)
+        keyboard = await _build_start_keyboard()
+        await update.message.reply_text(
+            "Будь ласка оберіть який регіон вас цікавить",
+            reply_markup=keyboard,
+        )
+        return
+    if text == "Контакти":
+        await update.message.reply_text(
+            "Зв'яжіться з нами:\n"
+            "https://t.me/dilyanki_odesa",
+            reply_markup=DEFAULT_NAV_KEYBOARD,
+        )
+        return
+
     state = _get_state(context)
 
     if state == STATE_COPY_NEW_PRICE:
