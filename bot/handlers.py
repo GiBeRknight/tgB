@@ -570,7 +570,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == "Контакти":
         await update.message.reply_text(
             "Зв'яжіться з нами:\n"
-            "@manager_zmappst",
+            "https://t.me/dilyanki_odesa",
             reply_markup=DEFAULT_NAV_KEYBOARD,
         )
         return
