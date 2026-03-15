@@ -213,14 +213,16 @@ async def region_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 .order_by(RegionPhoto.position)
             )
             photos = photos_result.scalars().all()
+        map_line = f'Карта: <a href="{region.link_map}">Переглянути на карті</a>' if region.link_map else "Карта: —"
+        yt_line = f'YouTube: <a href="{region.link_youtube}">Переглянути відео</a>' if region.link_youtube else "YouTube: —"
         text = (
             f"Назва: {region.name}\n"
             f"Ціна за сотку: {region.price}$\n"
             f"Кількість ділянок: {region.plots_number}\n"
             f"Розмір: {region.size} сот.\n"
             f"Опис: {region.describe or '—'}\n"
-            f"Карта: {region.link_map or '—'}\n"
-            f"YouTube: {region.link_youtube or '—'}"
+            f"{map_line}\n"
+            f"{yt_line}"
         )
         back_btn = InlineKeyboardMarkup(
             [[InlineKeyboardButton("Назад", callback_data=f"regionname_{region.name}")]]
@@ -241,12 +243,13 @@ async def region_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 media.append(InputMediaPhoto(
                     media=file_input,
                     caption=text if i == 0 else None,
+                    parse_mode="HTML" if i == 0 else None,
                 ))
             await context.bot.send_media_group(chat_id=chat_id, media=media)
             # Back button as a separate message (media groups don't support inline keyboards)
             await context.bot.send_message(chat_id=chat_id, text="Оберіть дію:", reply_markup=back_btn)
         else:
-            await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=back_btn)
+            await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=back_btn, parse_mode="HTML")
 
     elif data == "region_back":
         keyboard = await _build_start_keyboard()
