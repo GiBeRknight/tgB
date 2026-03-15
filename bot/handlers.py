@@ -31,6 +31,8 @@ STATE_CREATE_REALTOR_NAME = "create_realtor_name"
 STATE_CREATE_REALTOR_PASSWORD = "create_realtor_password"
 STATE_ADD_PHOTO = "add_photo"
 STATE_EDIT_ADD_PHOTO = "edit_add_photo"
+STATE_ADD_SCHEME_PHOTO = "add_scheme_photo"
+STATE_EDIT_SCHEME_PHOTO = "edit_scheme_photo"
 
 # --- Keyboards ---
 
@@ -57,15 +59,7 @@ ADMIN_MENU = InlineKeyboardMarkup(
     ]
 )
 
-REALTOR_MENU = InlineKeyboardMarkup(
-    [
-        [InlineKeyboardButton("Додати новий", callback_data="admin_add")],
-        [InlineKeyboardButton("Копіювати з новою ціною", callback_data="admin_copy_price")],
-        [InlineKeyboardButton("Копіювати з новим ім'ям", callback_data="admin_copy_name")],
-        [InlineKeyboardButton("Редагувати", callback_data="admin_edit")],
-        [InlineKeyboardButton("Назад", callback_data="admin_back")],
-    ]
-)
+REALTOR_MENU = None  # Realtors see the same view as regular users (with extra info)
 
 CONFIRM_KEYBOARD = InlineKeyboardMarkup(
     [
@@ -90,6 +84,7 @@ FIELD_LABELS = {
     "link_map": "Посилання на карту",
     "link_youtube": "Посилання на YouTube",
     "photo_file_id": "Фото",
+    "scheme_photo_id": "Фото-схема",
 }
 
 
@@ -102,7 +97,7 @@ def _set_state(context: ContextTypes.DEFAULT_TYPE, state: str):
 
 
 def _get_menu(context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
-    return ADMIN_MENU if context.user_data.get("role") == "admin" else REALTOR_MENU
+    return ADMIN_MENU
 
 
 async def _log_action(user_id: int, username: str | None, action: str):
@@ -215,10 +210,15 @@ async def region_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             photos = photos_result.scalars().all()
         map_line = f'Карта: <a href="{region.link_map}">Переглянути на карті</a>' if region.link_map else "Карта: —"
         yt_line = f'YouTube: <a href="{region.link_youtube}">Переглянути відео</a>' if region.link_youtube else "YouTube: —"
+        role = context.user_data.get("role")
+        is_privileged = role in ("admin", "realtor")
         text = (
             f"Назва: {region.name}\n"
             f"Ціна за сотку: {region.price}$\n"
-            f"Кількість ділянок: {region.plots_number}\n"
+        )
+        if is_privileged:
+            text += f"Кількість ділянок: {region.plots_number}\n"
+        text += (
             f"Розмір: {region.size} сот.\n"
             f"Опис: {region.describe or '—'}\n"
             f"{map_line}\n"
@@ -246,10 +246,18 @@ async def region_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="HTML" if i == 0 else None,
                 ))
             await context.bot.send_media_group(chat_id=chat_id, media=media)
-            # Back button as a separate message (media groups don't support inline keyboards)
-            await context.bot.send_message(chat_id=chat_id, text="Оберіть дію:", reply_markup=back_btn)
         else:
-            await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=back_btn, parse_mode="HTML")
+            await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+
+        # Send scheme photo for admins/realtors
+        if is_privileged and region.scheme_photo_id:
+            await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=region.scheme_photo_id,
+                caption="Фото-схема ділянки",
+            )
+
+        await context.bot.send_message(chat_id=chat_id, text="‎", reply_markup=back_btn)
 
     elif data == "region_back":
         keyboard = await _build_start_keyboard()
@@ -281,11 +289,8 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _handle_create_realtor(query, context)
     elif data == "admin_back":
         _set_state(context, STATE_IDLE)
-        keyboard = await _build_start_keyboard()
-        await query.edit_message_text(
-            "Це бот першої земельної компанії, будь ласка оберіть який регіон вас цікавить",
-            reply_markup=keyboard,
-        )
+        menu = _get_menu(context)
+        await query.edit_message_text("Панель адміністратора:", reply_markup=menu)
     elif data.startswith("copyreg_price_"):
         await _handle_copy_pick(query, context, "price")
     elif data.startswith("copyreg_name_"):
@@ -318,6 +323,16 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "Надішліть фото (PNG/JPG/WebP), можна кілька по одному:", reply_markup=done_kb
         )
+    elif data == "skip_scheme_photo":
+        # Skip scheme photo during creation, proceed to regular photos
+        _set_state(context, STATE_ADD_PHOTO)
+        skip_kb = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("⏩ Пропустити / Готово", callback_data="addphoto_done")]]
+        )
+        await query.edit_message_text(
+            "Надішліть фото ділянки (PNG/JPG/WebP), можна кілька по одному:",
+            reply_markup=skip_kb,
+        )
 
 
 # ──────────────────────────────────────
@@ -347,7 +362,11 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if user and user.is_realtor:
             context.user_data["role"] = "realtor"
-            await update.message.reply_text("Панель ріелтора:", reply_markup=REALTOR_MENU)
+            keyboard = await _build_start_keyboard()
+            await update.message.reply_text(
+                "Ви увійшли як ріелтор. Оберіть регіон:",
+                reply_markup=keyboard,
+            )
             return
 
     _set_state(context, STATE_LOGIN_PASSWORD)
@@ -452,6 +471,7 @@ async def _handle_copy_pick(query, context, copy_field: str):
             "describe": region.describe,
             "link_map": region.link_map,
             "link_youtube": region.link_youtube,
+            "scheme_photo_id": region.scheme_photo_id,
         }
         context.user_data["new_region_photos"] = photo_ids
 
@@ -532,6 +552,10 @@ async def _handle_edit_pick_field(query, context):
         region_id = context.user_data.get("edit_region_id")
         text, kb = await _photo_mgmt(region_id, context)
         await query.edit_message_text(text, reply_markup=kb)
+        return
+    elif field == "scheme_photo_id":
+        _set_state(context, STATE_EDIT_SCHEME_PHOTO)
+        await query.edit_message_text("Надішліть нову фото-схему ділянки:")
         return
     else:
         _set_state(context, STATE_EDIT_VALUE)
@@ -664,8 +688,10 @@ async def _on_login_password(update: Update, context: ContextTypes.DEFAULT_TYPE)
         _set_state(context, STATE_IDLE)
         context.user_data["role"] = "realtor"
         await _log_action(tg_user.id, tg_user.username, f"Увійшов як ріелтор «{matched.name}»")
+        keyboard = await _build_start_keyboard()
         await update.message.reply_text(
-            f"Ви увійшли як ріелтор «{matched.name}».", reply_markup=REALTOR_MENU
+            f"Ви увійшли як ріелтор «{matched.name}». Оберіть регіон:",
+            reply_markup=keyboard,
         )
         return
 
@@ -731,12 +757,12 @@ async def _on_add_link_map(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _on_add_link_youtube(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     context.user_data["new_region"]["link_youtube"] = None if text == "/skip" else text
-    _set_state(context, STATE_ADD_PHOTO)
+    _set_state(context, STATE_ADD_SCHEME_PHOTO)
     skip_kb = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("⏩ Пропустити / Готово", callback_data="addphoto_done")]]
+        [[InlineKeyboardButton("⏩ Пропустити", callback_data="skip_scheme_photo")]]
     )
     await update.message.reply_text(
-        "Надішліть фото ділянки (PNG/JPG/WebP), можна кілька по одному:",
+        "Надішліть фото-схему ділянки (або пропустіть):",
         reply_markup=skip_kb,
     )
 
@@ -868,6 +894,34 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_id = update.message.document.file_id
         file_type = "document"
     else:
+        return
+
+    if state == STATE_ADD_SCHEME_PHOTO:
+        context.user_data["new_region"]["scheme_photo_id"] = file_id
+        _set_state(context, STATE_ADD_PHOTO)
+        skip_kb = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("⏩ Пропустити / Готово", callback_data="addphoto_done")]]
+        )
+        await update.message.reply_text(
+            "Фото-схему збережено! Надішліть фото ділянки (PNG/JPG/WebP), можна кілька по одному:",
+            reply_markup=skip_kb,
+        )
+        return
+
+    if state == STATE_EDIT_SCHEME_PHOTO:
+        region_id = context.user_data.get("edit_region_id")
+        async with async_session() as session:
+            region = await session.get(Region, region_id)
+            if region:
+                region.scheme_photo_id = file_id
+                await session.commit()
+        await _log_action(
+            update.effective_user.id,
+            update.effective_user.username,
+            f"Оновив фото-схему регіону #{region_id}",
+        )
+        _set_state(context, STATE_IDLE)
+        await update.message.reply_text("Фото-схему оновлено!", reply_markup=_get_menu(context))
         return
 
     if state == STATE_ADD_PHOTO:
