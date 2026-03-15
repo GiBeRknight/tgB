@@ -50,6 +50,7 @@ async def _build_start_keyboard() -> InlineKeyboardMarkup:
 
 ADMIN_MENU = InlineKeyboardMarkup(
     [
+        [InlineKeyboardButton("Переглянути ділянки", callback_data="admin_view_regions")],
         [InlineKeyboardButton("Додати новий", callback_data="admin_add")],
         [InlineKeyboardButton("Копіювати з новою ціною", callback_data="admin_copy_price")],
         [InlineKeyboardButton("Копіювати з новим ім'ям", callback_data="admin_copy_name")],
@@ -257,7 +258,7 @@ async def region_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 caption="Фото-схема ділянки",
             )
 
-        await context.bot.send_message(chat_id=chat_id, text="‎", reply_markup=back_btn)
+        await context.bot.send_message(chat_id=chat_id, text="\u2800", reply_markup=back_btn)
 
     elif data == "region_back":
         keyboard = await _build_start_keyboard()
@@ -277,7 +278,10 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
 
-    if data == "admin_add":
+    if data == "admin_view_regions":
+        keyboard = await _build_start_keyboard()
+        await query.edit_message_text("Оберіть регіон:", reply_markup=keyboard)
+    elif data == "admin_add":
         await _handle_admin_add(query, context)
     elif data == "admin_copy_price":
         await _handle_copy_list(query, context, "price")
