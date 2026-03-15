@@ -1,7 +1,7 @@
 from decimal import Decimal, InvalidOperation
 
 from sqlalchemy import select
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
+from telegram import InputMediaPhoto, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
@@ -227,16 +227,26 @@ async def region_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         chat_id = query.message.chat_id
         await query.message.delete()
-        # Text with info and back button always comes first
-        await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=back_btn)
-        # Photos below the text; documents are re-downloaded and sent as photos
-        for p in photos:
-            if p.file_type == "photo":
-                await context.bot.send_photo(chat_id=chat_id, photo=p.file_id)
-            else:
-                tg_file = await context.bot.get_file(p.file_id)
-                file_bytes = await tg_file.download_as_bytearray()
-                await context.bot.send_photo(chat_id=chat_id, photo=bytes(file_bytes))
+
+        if photos:
+            # Build media group: first photo gets the caption with region info
+            media = []
+            for i, p in enumerate(photos):
+                if p.file_type == "photo":
+                    file_input = p.file_id
+                else:
+                    tg_file = await context.bot.get_file(p.file_id)
+                    file_bytes = await tg_file.download_as_bytearray()
+                    file_input = bytes(file_bytes)
+                media.append(InputMediaPhoto(
+                    media=file_input,
+                    caption=text if i == 0 else None,
+                ))
+            await context.bot.send_media_group(chat_id=chat_id, media=media)
+            # Back button as a separate message (media groups don't support inline keyboards)
+            await context.bot.send_message(chat_id=chat_id, text="⬇️", reply_markup=back_btn)
+        else:
+            await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=back_btn)
 
     elif data == "region_back":
         keyboard = await _build_start_keyboard()
