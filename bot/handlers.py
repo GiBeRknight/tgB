@@ -281,11 +281,8 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _handle_create_realtor(query, context)
     elif data == "admin_back":
         _set_state(context, STATE_IDLE)
-        keyboard = await _build_start_keyboard()
-        await query.edit_message_text(
-            "Це бот першої земельної компанії, будь ласка оберіть який регіон вас цікавить",
-            reply_markup=keyboard,
-        )
+        menu = _get_menu(context)
+        await query.edit_message_text("Панель адміністратора:", reply_markup=menu)
     elif data.startswith("copyreg_price_"):
         await _handle_copy_pick(query, context, "price")
     elif data.startswith("copyreg_name_"):
