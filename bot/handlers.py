@@ -247,7 +247,7 @@ async def region_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ))
             await context.bot.send_media_group(chat_id=chat_id, media=media)
             # Back button as a separate message (media groups don't support inline keyboards)
-            await context.bot.send_message(chat_id=chat_id, text="Оберіть дію:", reply_markup=back_btn)
+            await context.bot.send_message(chat_id=chat_id, text="‎", reply_markup=back_btn)
         else:
             await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=back_btn, parse_mode="HTML")
 
