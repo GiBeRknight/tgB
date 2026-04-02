@@ -53,4 +53,16 @@ async def init_db():
     except Exception as exc:
         logger.warning("Index creation failed: %s", exc)
 
+    # Seed default region groups if table is empty
+    try:
+        from bot.models import RegionGroup
+        async with async_session() as session:
+            count = (await session.execute(text("SELECT count(*) FROM region_groups"))).scalar()
+            if count == 0:
+                session.add(RegionGroup(label="Грюнсдорф", prefix="Грюнсдорф"))
+                await session.commit()
+                logger.info("Seeded default region group 'Грюнсдорф'")
+    except Exception as exc:
+        logger.warning("Region group seeding skipped: %s", exc)
+
     logger.info("Schema migrations applied")
