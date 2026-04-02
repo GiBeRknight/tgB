@@ -37,15 +37,34 @@ STATE_EDIT_SCHEME_PHOTO = "edit_scheme_photo"
 # --- Keyboards ---
 
 
+REGION_GROUPS: dict[str, str] = {
+    "Грюнсдорф": "Грюнсдорф",
+}
+
+
 async def _build_start_keyboard() -> InlineKeyboardMarkup:
     """Build start keyboard with unique region names from DB."""
     async with async_session() as session:
         regions = (await session.execute(select(Region))).scalars().all()
     unique_names = sorted(set(r.name for r in regions))
-    buttons = [
-        [InlineKeyboardButton(name, callback_data=f"regionname_{name}")]
-        for name in unique_names
-    ]
+
+    buttons: list[list[InlineKeyboardButton]] = []
+    added_groups: set[str] = set()
+
+    for name in unique_names:
+        grouped = False
+        for group_label, prefix in REGION_GROUPS.items():
+            if name.startswith(prefix):
+                if group_label not in added_groups:
+                    buttons.append([InlineKeyboardButton(
+                        group_label, callback_data=f"regiongroup_{group_label}"
+                    )])
+                    added_groups.add(group_label)
+                grouped = True
+                break
+        if not grouped:
+            buttons.append([InlineKeyboardButton(name, callback_data=f"regionname_{name}")])
+
     return InlineKeyboardMarkup(buttons)
 
 ADMIN_MENU = InlineKeyboardMarkup(
@@ -169,7 +188,26 @@ async def region_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
 
-    if data.startswith("regionname_"):
+    if data.startswith("regiongroup_"):
+        group_label = data.replace("regiongroup_", "", 1)
+        prefix = REGION_GROUPS.get(group_label, group_label)
+        async with async_session() as session:
+            regions = (await session.execute(select(Region))).scalars().all()
+        sub_names = sorted(set(r.name for r in regions if r.name.startswith(prefix)))
+        buttons = [
+            [InlineKeyboardButton(name, callback_data=f"regionname_{name}")]
+            for name in sub_names
+        ]
+        buttons.append([InlineKeyboardButton("Назад", callback_data="region_back")])
+        reply_markup = InlineKeyboardMarkup(buttons)
+        msg_text = f"Оберіть локацію в «{group_label}»:"
+        if query.message.photo:
+            await query.message.delete()
+            await query.message.reply_text(msg_text, reply_markup=reply_markup)
+        else:
+            await query.edit_message_text(msg_text, reply_markup=reply_markup)
+
+    elif data.startswith("regionname_"):
         # Show all regions with this name (buttons: name — price$ — size сот.)
         name = data.replace("regionname_", "", 1)
         async with async_session() as session:
