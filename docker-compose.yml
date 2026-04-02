@@ -1,23 +1,29 @@
-version: "3.9"
-
 services:
   db:
-    image: postgres:15-alpine
+    image: postgres:16
+    restart: unless-stopped
     environment:
-      POSTGRES_DB: bot
       POSTGRES_USER: bot
       POSTGRES_PASSWORD: bot
+      POSTGRES_DB: bot
+    volumes:
+      - pgdata:/var/lib/postgresql/data
     ports:
       - "5432:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
 
   bot:
     build: .
-    env_file:
-      - .env
+    restart: unless-stopped
     depends_on:
       - db
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin123}
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_USER: bot
+      DB_PASSWORD: bot
+      DB_NAME: bot
 
 volumes:
-  postgres_data:
+  pgdata:
