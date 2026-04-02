@@ -36,6 +36,7 @@ async def init_db():
         "ALTER TABLE regions ADD COLUMN IF NOT EXISTS photo_file_id VARCHAR(500) DEFAULT NULL",
         "ALTER TABLE region_photos ADD COLUMN IF NOT EXISTS file_type VARCHAR(20) DEFAULT 'photo'",
         "ALTER TABLE regions ADD COLUMN IF NOT EXISTS scheme_photo_id VARCHAR(500) DEFAULT NULL",
+        "ALTER TABLE regions ADD COLUMN IF NOT EXISTS link_doc VARCHAR(500) DEFAULT NULL",
     ]
     for stmt in alter_statements:
         try:
