@@ -56,6 +56,7 @@ class Region(Base):
     link_map: Mapped[str | None] = mapped_column(String(500), nullable=True)
     size: Mapped[int] = mapped_column(Integer, default=5)
     link_youtube: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    link_doc: Mapped[str | None] = mapped_column(String(500), nullable=True)
     scheme_photo_id: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
 

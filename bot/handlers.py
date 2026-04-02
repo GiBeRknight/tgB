@@ -1,3 +1,4 @@
+import re
 from decimal import Decimal, InvalidOperation
 
 from sqlalchemy import select
@@ -33,6 +34,7 @@ STATE_ADD_PHOTO = "add_photo"
 STATE_EDIT_ADD_PHOTO = "edit_add_photo"
 STATE_ADD_SCHEME_PHOTO = "add_scheme_photo"
 STATE_EDIT_SCHEME_PHOTO = "edit_scheme_photo"
+STATE_ADD_LINK_DOC = "add_link_doc"
 STATE_GROUP_ADD_LABEL = "group_add_label"
 STATE_GROUP_ADD_PREFIX = "group_add_prefix"
 
@@ -109,6 +111,7 @@ FIELD_LABELS = {
     "describe": "Опис",
     "link_map": "Посилання на карту",
     "link_youtube": "Посилання на YouTube",
+    "link_doc": "Документ доступності (Google Drive)",
     "photo_file_id": "Фото",
     "scheme_photo_id": "Фото-схема",
 }
@@ -131,6 +134,19 @@ async def _log_action(user_id: int, username: str | None, action: str):
         log = ActionLog(user_id=user_id, username=username, action=action)
         session.add(log)
         await session.commit()
+
+
+def _gdrive_to_download(url: str) -> str:
+    """Convert a Google Drive view/share URL to a direct download URL."""
+    # Pattern: https://drive.google.com/file/d/FILE_ID/view...
+    m = re.search(r"drive\.google\.com/file/d/([^/]+)", url)
+    if m:
+        return f"https://drive.google.com/uc?export=download&id={m.group(1)}"
+    # Pattern: https://drive.google.com/open?id=FILE_ID
+    m = re.search(r"drive\.google\.com/open\?id=([^&]+)", url)
+    if m:
+        return f"https://drive.google.com/uc?export=download&id={m.group(1)}"
+    return url
 
 
 # ──────────────────────────────────────
@@ -270,10 +286,17 @@ async def region_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{map_line}\n"
             f"{yt_line}"
         )
-        nav_btn = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Назад", callback_data=f"regionname_{region.name}"),
-             InlineKeyboardButton("Головна", callback_data="region_back")],
+        nav_buttons = []
+        if is_privileged and region.link_doc:
+            download_url = _gdrive_to_download(region.link_doc)
+            nav_buttons.append([InlineKeyboardButton(
+                "📄 Завантажити документ доступності", url=download_url
+            )])
+        nav_buttons.append([
+            InlineKeyboardButton("Назад", callback_data=f"regionname_{region.name}"),
+            InlineKeyboardButton("Головна", callback_data="region_back"),
         ])
+        nav_btn = InlineKeyboardMarkup(nav_buttons)
         chat_id = query.message.chat_id
         await query.message.delete()
 
@@ -818,6 +841,8 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _on_add_link_map(update, context)
     elif state == STATE_ADD_LINK_YOUTUBE:
         await _on_add_link_youtube(update, context)
+    elif state == STATE_ADD_LINK_DOC:
+        await _on_add_link_doc(update, context)
     elif state == STATE_EDIT_VALUE:
         await _on_edit_value(update, context)
     elif state == STATE_GROUP_ADD_LABEL:
@@ -955,6 +980,13 @@ async def _on_add_link_map(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _on_add_link_youtube(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     context.user_data["new_region"]["link_youtube"] = None if text == "/skip" else text
+    _set_state(context, STATE_ADD_LINK_DOC)
+    await update.message.reply_text("Введіть посилання на документ доступності (Google Drive) або /skip:")
+
+
+async def _on_add_link_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    context.user_data["new_region"]["link_doc"] = None if text == "/skip" else text
     _set_state(context, STATE_ADD_SCHEME_PHOTO)
     skip_kb = InlineKeyboardMarkup(
         [[InlineKeyboardButton("⏩ Пропустити", callback_data="skip_scheme_photo")]]
@@ -976,6 +1008,7 @@ def _region_summary(data: dict, photos: list | None = None) -> str:
         f"Опис: {data.get('describe') or '—'}\n"
         f"Карта: {data.get('link_map') or '—'}\n"
         f"YouTube: {data.get('link_youtube') or '—'}\n"
+        f"Документ доступності: {data.get('link_doc') or '—'}\n"
         f"Фото: {photo_str}"
     )
 
