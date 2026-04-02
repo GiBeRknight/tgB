@@ -59,6 +59,14 @@ class Region(Base):
     scheme_photo_id: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
 
+class RegionGroup(Base):
+    __tablename__ = "region_groups"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    label: Mapped[str] = mapped_column(String(255), unique=True)
+    prefix: Mapped[str] = mapped_column(String(255))
+
+
 class RegionPhoto(Base):
     __tablename__ = "region_photos"
 

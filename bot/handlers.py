@@ -12,7 +12,7 @@ from telegram.ext import (
 
 from bot.config import ADMIN_PASSWORD
 from bot.db import async_session
-from bot.models import ActionLog, Realtor, Region, RegionPhoto, User
+from bot.models import ActionLog, Realtor, Region, RegionGroup, RegionPhoto, User
 
 # --- Manual state constants ---
 STATE_IDLE = "idle"
@@ -33,13 +33,17 @@ STATE_ADD_PHOTO = "add_photo"
 STATE_EDIT_ADD_PHOTO = "edit_add_photo"
 STATE_ADD_SCHEME_PHOTO = "add_scheme_photo"
 STATE_EDIT_SCHEME_PHOTO = "edit_scheme_photo"
+STATE_GROUP_ADD_LABEL = "group_add_label"
+STATE_GROUP_ADD_PREFIX = "group_add_prefix"
 
 # --- Keyboards ---
 
 
-REGION_GROUPS: dict[str, str] = {
-    "Грюнсдорф": "Грюнсдорф",
-}
+async def _load_region_groups() -> dict[str, str]:
+    """Load region groups from DB: {label: prefix}."""
+    async with async_session() as session:
+        groups = (await session.execute(select(RegionGroup))).scalars().all()
+    return {g.label: g.prefix for g in groups}
 
 
 async def _build_start_keyboard() -> InlineKeyboardMarkup:
@@ -47,13 +51,14 @@ async def _build_start_keyboard() -> InlineKeyboardMarkup:
     async with async_session() as session:
         regions = (await session.execute(select(Region))).scalars().all()
     unique_names = sorted(set(r.name for r in regions))
+    groups = await _load_region_groups()
 
     buttons: list[list[InlineKeyboardButton]] = []
     added_groups: set[str] = set()
 
     for name in unique_names:
         grouped = False
-        for group_label, prefix in REGION_GROUPS.items():
+        for group_label, prefix in groups.items():
             if name.startswith(prefix):
                 if group_label not in added_groups:
                     buttons.append([InlineKeyboardButton(
@@ -75,6 +80,7 @@ ADMIN_MENU = InlineKeyboardMarkup(
         [InlineKeyboardButton("Копіювати з новим ім'ям", callback_data="admin_copy_name")],
         [InlineKeyboardButton("Редагувати", callback_data="admin_edit")],
         [InlineKeyboardButton("Створити ріелтора", callback_data="admin_create_realtor")],
+        [InlineKeyboardButton("Групи регіонів", callback_data="admin_groups")],
         [InlineKeyboardButton("Назад", callback_data="admin_back")],
     ]
 )
@@ -190,7 +196,8 @@ async def region_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("regiongroup_"):
         group_label = data.replace("regiongroup_", "", 1)
-        prefix = REGION_GROUPS.get(group_label, group_label)
+        groups = await _load_region_groups()
+        prefix = groups.get(group_label, group_label)
         async with async_session() as session:
             regions = (await session.execute(select(Region))).scalars().all()
         sub_names = sorted(set(r.name for r in regions if r.name.startswith(prefix)))
@@ -330,6 +337,23 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _handle_admin_edit(query, context)
     elif data == "admin_create_realtor":
         await _handle_create_realtor(query, context)
+    elif data == "admin_groups":
+        await _handle_admin_groups(query, context)
+    elif data == "admin_group_add":
+        _set_state(context, STATE_GROUP_ADD_LABEL)
+        await query.edit_message_text("Введіть назву групи (наприклад: Грюнсдорф):")
+    elif data.startswith("admin_group_del_"):
+        group_id = int(data.replace("admin_group_del_", ""))
+        async with async_session() as session:
+            group = await session.get(RegionGroup, group_id)
+            if group:
+                label = group.label
+                await session.delete(group)
+                await session.commit()
+                await _log_action(query.from_user.id, query.from_user.username, f"Видалив групу «{label}»")
+        await _handle_admin_groups(query, context)
+    elif data.startswith("noop_"):
+        pass  # informational buttons, no action needed
     elif data == "admin_back":
         _set_state(context, STATE_IDLE)
         menu = _get_menu(context)
@@ -376,6 +400,24 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Надішліть фото ділянки (PNG/JPG/WebP), можна кілька по одному:",
             reply_markup=skip_kb,
         )
+
+
+# ──────────────────────────────────────
+#  Region groups management
+# ──────────────────────────────────────
+async def _handle_admin_groups(query, context):
+    async with async_session() as session:
+        groups = (await session.execute(select(RegionGroup))).scalars().all()
+    buttons: list[list[InlineKeyboardButton]] = []
+    for g in groups:
+        buttons.append([
+            InlineKeyboardButton(f"{g.label} (префікс: {g.prefix})", callback_data=f"noop_group_{g.id}"),
+            InlineKeyboardButton("❌", callback_data=f"admin_group_del_{g.id}"),
+        ])
+    buttons.append([InlineKeyboardButton("➕ Додати групу", callback_data="admin_group_add")])
+    buttons.append([InlineKeyboardButton("Назад", callback_data="admin_back")])
+    text = "Групи регіонів:" if groups else "Груп поки немає."
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
 
 
 # ──────────────────────────────────────
@@ -698,6 +740,39 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _on_add_link_youtube(update, context)
     elif state == STATE_EDIT_VALUE:
         await _on_edit_value(update, context)
+    elif state == STATE_GROUP_ADD_LABEL:
+        await _on_group_add_label(update, context)
+    elif state == STATE_GROUP_ADD_PREFIX:
+        await _on_group_add_prefix(update, context)
+
+
+# ──────────────────────────────────────
+#  Group add steps
+# ──────────────────────────────────────
+async def _on_group_add_label(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["new_group_label"] = update.message.text.strip()
+    _set_state(context, STATE_GROUP_ADD_PREFIX)
+    await update.message.reply_text(
+        "Введіть префікс для пошуку ділянок (наприклад: Грюнсдорф).\n"
+        "Усі ділянки, назва яких починається з цього префіксу, потраплять у групу:"
+    )
+
+
+async def _on_group_add_prefix(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    label = context.user_data.pop("new_group_label", "")
+    prefix = update.message.text.strip()
+    async with async_session() as session:
+        session.add(RegionGroup(label=label, prefix=prefix))
+        await session.commit()
+    await _log_action(
+        update.effective_user.id,
+        update.effective_user.username,
+        f"Додав групу «{label}» (префікс: {prefix})",
+    )
+    _set_state(context, STATE_IDLE)
+    await update.message.reply_text(
+        f"Групу «{label}» створено!", reply_markup=_get_menu(context)
+    )
 
 
 # ──────────────────────────────────────
