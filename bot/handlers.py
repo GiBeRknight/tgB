@@ -366,6 +366,8 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _handle_edit_pick_region(query, context)
     elif data.startswith("editfield_"):
         await _handle_edit_pick_field(query, context)
+    elif data.startswith("assigngroup_"):
+        await _handle_assign_group(query, context)
     elif data in ("confirm_yes", "confirm_no"):
         await _handle_add_confirm(query, context)
     elif data == "addphoto_done":
@@ -622,6 +624,7 @@ async def _handle_edit_pick_region(query, context):
         [InlineKeyboardButton(label, callback_data=f"editfield_{field}")]
         for field, label in FIELD_LABELS.items()
     ]
+    buttons.append([InlineKeyboardButton("📁 Група", callback_data="editfield_group")])
     buttons.append([InlineKeyboardButton("Назад", callback_data="admin_edit")])
     keyboard = InlineKeyboardMarkup(buttons)
     await query.edit_message_text(
@@ -633,7 +636,10 @@ async def _handle_edit_pick_field(query, context):
     field = query.data.replace("editfield_", "")
     context.user_data["edit_field"] = field
     label = FIELD_LABELS.get(field, field)
-    if field == "photo_file_id":
+    if field == "group":
+        await _handle_edit_group(query, context)
+        return
+    elif field == "photo_file_id":
         region_id = context.user_data.get("edit_region_id")
         text, kb = await _photo_mgmt(region_id, context)
         await query.edit_message_text(text, reply_markup=kb)
@@ -645,6 +651,80 @@ async def _handle_edit_pick_field(query, context):
     else:
         _set_state(context, STATE_EDIT_VALUE)
         await query.edit_message_text(f"Введіть нове значення для '{label}':")
+
+
+async def _handle_edit_group(query, context):
+    """Show group assignment options for the region being edited."""
+    region_id = context.user_data.get("edit_region_id")
+    async with async_session() as session:
+        region = await session.get(Region, region_id)
+        groups = (await session.execute(select(RegionGroup))).scalars().all()
+
+    # Determine current group
+    current_group = None
+    for g in groups:
+        if region and region.name.startswith(g.prefix):
+            current_group = g
+            break
+
+    buttons: list[list[InlineKeyboardButton]] = []
+    for g in groups:
+        marker = " ✅" if current_group and current_group.id == g.id else ""
+        buttons.append([InlineKeyboardButton(
+            f"{g.label}{marker}",
+            callback_data=f"assigngroup_{g.id}",
+        )])
+    buttons.append([InlineKeyboardButton("Назад", callback_data=f"editreg_{region_id}")])
+    current_text = f"Поточна група: «{current_group.label}»" if current_group else "Регіон не входить у жодну групу"
+    await query.edit_message_text(
+        f"{current_text}\n\nОберіть групу, до якої додати «{region.name}»:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def _handle_assign_group(query, context):
+    """Rename a region to include the group prefix."""
+    group_id = int(query.data.replace("assigngroup_", ""))
+    region_id = context.user_data.get("edit_region_id")
+    async with async_session() as session:
+        region = await session.get(Region, region_id)
+        group = await session.get(RegionGroup, group_id)
+        if not region or not group:
+            await query.edit_message_text("Помилка: регіон або групу не знайдено.", reply_markup=_get_menu(context))
+            return
+
+        # Check if already in this group
+        if region.name.startswith(group.prefix):
+            await query.edit_message_text(
+                f"«{region.name}» вже входить у групу «{group.label}».",
+                reply_markup=_get_menu(context),
+            )
+            return
+
+        # Strip any existing group prefix from other groups
+        all_groups = (await session.execute(select(RegionGroup))).scalars().all()
+        clean_name = region.name
+        for g in all_groups:
+            if clean_name.startswith(g.prefix):
+                clean_name = clean_name[len(g.prefix):].lstrip("-– ")
+                break
+
+        # Build new name: prefix-cleanname
+        new_name = f"{group.prefix}-{clean_name}" if clean_name else group.prefix
+        old_name = region.name
+        region.name = new_name
+        await session.commit()
+
+    await _log_action(
+        query.from_user.id,
+        query.from_user.username,
+        f"Переніс «{old_name}» → «{new_name}» (група «{group.label}»)",
+    )
+    await query.edit_message_text(
+        f"Регіон перейменовано: «{old_name}» → «{new_name}»\n"
+        f"Тепер він входить у групу «{group.label}».",
+        reply_markup=_get_menu(context),
+    )
 
 
 # ──────────────────────────────────────
