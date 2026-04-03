@@ -83,7 +83,6 @@ ADMIN_MENU = InlineKeyboardMarkup(
         [InlineKeyboardButton("Редагувати", callback_data="admin_edit")],
         [InlineKeyboardButton("Створити ріелтора", callback_data="admin_create_realtor")],
         [InlineKeyboardButton("Групи регіонів", callback_data="admin_groups")],
-        [InlineKeyboardButton("Назад", callback_data="admin_back")],
     ]
 )
 
@@ -639,19 +638,23 @@ async def _handle_photodel(query, context):
 # ──────────────────────────────────────
 #  Edit region callbacks
 # ──────────────────────────────────────
-async def _handle_edit_pick_region(query, context):
-    region_id = int(query.data.replace("editreg_", ""))
-    context.user_data["edit_region_id"] = region_id
-
+def _edit_fields_keyboard(region_id: int) -> InlineKeyboardMarkup:
+    """Build the field-selection keyboard for editing a region."""
     buttons = [
         [InlineKeyboardButton(label, callback_data=f"editfield_{field}")]
         for field, label in FIELD_LABELS.items()
     ]
     buttons.append([InlineKeyboardButton("📁 Група", callback_data="editfield_group")])
     buttons.append([InlineKeyboardButton("Назад", callback_data="admin_edit")])
-    keyboard = InlineKeyboardMarkup(buttons)
+    return InlineKeyboardMarkup(buttons)
+
+
+async def _handle_edit_pick_region(query, context):
+    region_id = int(query.data.replace("editreg_", ""))
+    context.user_data["edit_region_id"] = region_id
+
     await query.edit_message_text(
-        "Оберіть поле для редагування:", reply_markup=keyboard
+        "Оберіть поле для редагування:", reply_markup=_edit_fields_keyboard(region_id)
     )
 
 
@@ -719,8 +722,9 @@ async def _handle_assign_group(query, context):
         # Check if already in this group
         if region.name.startswith(group.prefix):
             await query.edit_message_text(
-                f"«{region.name}» вже входить у групу «{group.label}».",
-                reply_markup=_get_menu(context),
+                f"«{region.name}» вже входить у групу «{group.label}».\n\n"
+                f"Оберіть поле для редагування:",
+                reply_markup=_edit_fields_keyboard(region_id),
             )
             return
 
@@ -743,10 +747,12 @@ async def _handle_assign_group(query, context):
         query.from_user.username,
         f"Переніс «{old_name}» → «{new_name}» (група «{group.label}»)",
     )
+    region_id = context.user_data.get("edit_region_id")
     await query.edit_message_text(
         f"Регіон перейменовано: «{old_name}» → «{new_name}»\n"
-        f"Тепер він входить у групу «{group.label}».",
-        reply_markup=_get_menu(context),
+        f"Тепер він входить у групу «{group.label}».\n\n"
+        f"Оберіть поле для редагування:",
+        reply_markup=_edit_fields_keyboard(region_id),
     )
 
 
@@ -1075,7 +1081,10 @@ async def _on_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 tg_user.username,
                 f"Відредагував поле «{field}» регіону «{region.name}»",
             )
-            await update.message.reply_text("Оновлено!", reply_markup=_get_menu(context))
+            await update.message.reply_text(
+                "Оновлено! Оберіть поле для редагування:",
+                reply_markup=_edit_fields_keyboard(region_id),
+            )
         else:
             await update.message.reply_text(
                 "Регіон не знайдено.", reply_markup=_get_menu(context)
@@ -1083,7 +1092,6 @@ async def _on_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     _set_state(context, STATE_IDLE)
     context.user_data.pop("edit_field", None)
-    context.user_data.pop("edit_region_id", None)
 
 
 # ──────────────────────────────────────
@@ -1152,7 +1160,10 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Оновив фото-схему регіону #{region_id}",
         )
         _set_state(context, STATE_IDLE)
-        await update.message.reply_text("Фото-схему оновлено!", reply_markup=_get_menu(context))
+        await update.message.reply_text(
+            "Фото-схему оновлено! Оберіть поле для редагування:",
+            reply_markup=_edit_fields_keyboard(region_id),
+        )
         return
 
     if state == STATE_ADD_PHOTO:
