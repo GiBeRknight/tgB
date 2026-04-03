@@ -83,7 +83,6 @@ ADMIN_MENU = InlineKeyboardMarkup(
         [InlineKeyboardButton("Редагувати", callback_data="admin_edit")],
         [InlineKeyboardButton("Створити ріелтора", callback_data="admin_create_realtor")],
         [InlineKeyboardButton("Групи регіонів", callback_data="admin_groups")],
-        [InlineKeyboardButton("Назад", callback_data="admin_back")],
     ]
 )
 
