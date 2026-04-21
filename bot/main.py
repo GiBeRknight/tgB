@@ -1,4 +1,3 @@
-import html
 import logging
 import traceback
 
@@ -20,6 +19,7 @@ from bot.handlers import (
     help_command,
     photo_handler,
     region_callback,
+    skip_command,
     start,
     text_handler,
 )
@@ -43,10 +43,9 @@ async def error_handler(update: object, context) -> None:
     logger.error("Traceback:\n%s", tb_string)
 
     if isinstance(update, Update) and update.effective_chat:
-        text = f"Error: {html.escape(str(context.error))}"
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
-            text=text,
+            text="Сталася помилка. Спробуйте ще раз або натисніть /start.",
         )
 
 
@@ -61,6 +60,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("cancel", cancel))
+    app.add_handler(CommandHandler("skip", skip_command))
     app.add_handler(CommandHandler("admin", admin_command))
     app.add_handler(CallbackQueryHandler(region_callback, pattern="^region"))
     app.add_handler(CallbackQueryHandler(admin_callback))

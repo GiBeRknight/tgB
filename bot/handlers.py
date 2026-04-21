@@ -1,19 +1,18 @@
+import logging
 import re
+import bcrypt
+import httpx
 from decimal import Decimal, InvalidOperation
 
 from sqlalchemy import select
 from telegram import InputMediaPhoto, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
-from telegram.ext import (
-    CallbackQueryHandler,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
+from telegram.ext import ContextTypes
 
-from bot.config import ADMIN_PASSWORD
+from bot.config import ADMIN_PASSWORD, BOOKING_CONTACT_FALLBACK_URL, BOOKING_CONTACT_ID
 from bot.db import async_session
 from bot.models import ActionLog, Realtor, Region, RegionGroup, RegionPhoto, User
+
+logger = logging.getLogger(__name__)
 
 # --- Manual state constants ---
 STATE_IDLE = "idle"
@@ -35,42 +34,33 @@ STATE_EDIT_ADD_PHOTO = "edit_add_photo"
 STATE_ADD_SCHEME_PHOTO = "add_scheme_photo"
 STATE_EDIT_SCHEME_PHOTO = "edit_scheme_photo"
 STATE_ADD_LINK_DOC = "add_link_doc"
+STATE_ADD_GROUP = "add_group"
 STATE_GROUP_ADD_LABEL = "group_add_label"
-STATE_GROUP_ADD_PREFIX = "group_add_prefix"
 
 # --- Keyboards ---
 
 
-async def _load_region_groups() -> dict[str, str]:
-    """Load region groups from DB: {label: prefix}."""
-    async with async_session() as session:
-        groups = (await session.execute(select(RegionGroup))).scalars().all()
-    return {g.label: g.prefix for g in groups}
-
-
 async def _build_start_keyboard() -> InlineKeyboardMarkup:
-    """Build start keyboard with unique region names from DB."""
+    """Build start keyboard: one button per used group, plus buttons for ungrouped regions."""
     async with async_session() as session:
         regions = (await session.execute(select(Region))).scalars().all()
-    unique_names = sorted(set(r.name for r in regions))
-    groups = await _load_region_groups()
+        groups = (await session.execute(select(RegionGroup))).scalars().all()
+
+    groups_by_id = {g.id: g for g in groups}
+    used_group_ids: set[int] = set()
+    ungrouped_names: set[str] = set()
+
+    for r in regions:
+        if r.group_id is not None and r.group_id in groups_by_id:
+            used_group_ids.add(r.group_id)
+        else:
+            ungrouped_names.add(r.name)
 
     buttons: list[list[InlineKeyboardButton]] = []
-    added_groups: set[str] = set()
-
-    for name in unique_names:
-        grouped = False
-        for group_label, prefix in groups.items():
-            if name.startswith(prefix):
-                if group_label not in added_groups:
-                    buttons.append([InlineKeyboardButton(
-                        group_label, callback_data=f"regiongroup_{group_label}"
-                    )])
-                    added_groups.add(group_label)
-                grouped = True
-                break
-        if not grouped:
-            buttons.append([InlineKeyboardButton(name, callback_data=f"regionname_{name}")])
+    for g in sorted((groups_by_id[gid] for gid in used_group_ids), key=lambda x: x.label):
+        buttons.append([InlineKeyboardButton(g.label, callback_data=f"regiongroup_{g.id}")])
+    for name in sorted(ungrouped_names):
+        buttons.append([InlineKeyboardButton(name, callback_data=f"regionname_{name}")])
 
     return InlineKeyboardMarkup(buttons)
 
@@ -102,6 +92,11 @@ DEFAULT_NAV_KEYBOARD = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
+ADMIN_NAV_KEYBOARD = ReplyKeyboardMarkup(
+    [["Головна сторінка", "Контакти"], ["Адмін-панель"]],
+    resize_keyboard=True,
+)
+
 FIELD_LABELS = {
     "name": "Назва",
     "price": "Ціна",
@@ -111,9 +106,10 @@ FIELD_LABELS = {
     "link_map": "Посилання на карту",
     "link_youtube": "Посилання на YouTube",
     "link_doc": "Документ доступності (Google Drive)",
-    "photo_file_id": "Фото",
     "scheme_photo_id": "Фото-схема",
 }
+
+OPTIONAL_EDIT_FIELDS = {"describe", "link_map", "link_youtube", "link_doc"}
 
 
 def _get_state(context: ContextTypes.DEFAULT_TYPE) -> str:
@@ -133,6 +129,75 @@ async def _log_action(user_id: int, username: str | None, action: str):
         log = ActionLog(user_id=user_id, username=username, action=action)
         session.add(log)
         await session.commit()
+
+
+def _fmt_size(v) -> str:
+    """Format Decimal/number without trailing zeros."""
+    if v is None:
+        return "—"
+    s = str(v)
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s or "0"
+
+
+async def _nav_keyboard_for(user_id: int) -> ReplyKeyboardMarkup:
+    """Return the admin nav keyboard if the user is an admin, else the default."""
+    async with async_session() as session:
+        user = await session.get(User, user_id)
+    return ADMIN_NAV_KEYBOARD if user and user.is_admin else DEFAULT_NAV_KEYBOARD
+
+
+async def _fetch_drive_etag(url: str) -> str | None:
+    """Return an identifier (ETag or Content-Length) for the file at the URL, or None."""
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client:
+            r = await client.head(url)
+        etag = r.headers.get("etag") or r.headers.get("content-length")
+        return etag
+    except Exception as exc:
+        logger.warning("HEAD %s failed: %s", url, exc)
+        return None
+
+
+async def _send_region_doc(bot, chat_id: int, region: Region) -> None:
+    """Send the accessibility document, using cached Telegram file_id when possible."""
+    if not region.link_doc:
+        return
+    download_url = _gdrive_to_download(region.link_doc)
+    current_etag = await _fetch_drive_etag(download_url)
+
+    # Fast path: etag matches cache → send by file_id
+    if region.doc_file_id and current_etag and current_etag == region.doc_etag:
+        try:
+            await bot.send_document(
+                chat_id=chat_id,
+                document=region.doc_file_id,
+                caption="📄 Документ доступності",
+            )
+            return
+        except Exception as exc:
+            logger.warning("Cached file_id send failed for region %s: %s", region.id, exc)
+
+    # Full path: send by URL, capture new file_id
+    try:
+        msg = await bot.send_document(
+            chat_id=chat_id,
+            document=download_url,
+            caption="📄 Документ доступності",
+        )
+    except Exception as exc:
+        logger.warning("Doc send failed for region %s: %s", region.id, exc)
+        return
+
+    new_file_id = msg.document.file_id if msg and msg.document else None
+    if new_file_id:
+        async with async_session() as session:
+            fresh = await session.get(Region, region.id)
+            if fresh:
+                fresh.doc_file_id = new_file_id
+                fresh.doc_etag = current_etag
+                await session.commit()
 
 
 def _gdrive_to_download(url: str) -> str:
@@ -166,9 +231,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await session.commit()
 
     # Send persistent navigation buttons
+    nav_kb = ADMIN_NAV_KEYBOARD if user.is_admin else DEFAULT_NAV_KEYBOARD
     await update.message.reply_text(
         "Вітаємо! Це бот першої земельної компанії.",
-        reply_markup=DEFAULT_NAV_KEYBOARD,
+        reply_markup=nav_kb,
     )
 
     keyboard = await _build_start_keyboard()
@@ -202,6 +268,59 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ──────────────────────────────────────
+#  /skip
+# ──────────────────────────────────────
+async def skip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    state = _get_state(context)
+
+    if state == STATE_ADD_DESCRIBE:
+        await _on_add_describe(update, context)
+        return
+    if state == STATE_ADD_LINK_MAP:
+        await _on_add_link_map(update, context)
+        return
+    if state == STATE_ADD_LINK_YOUTUBE:
+        await _on_add_link_youtube(update, context)
+        return
+    if state == STATE_ADD_LINK_DOC:
+        await _on_add_link_doc(update, context)
+        return
+
+    if state == STATE_EDIT_VALUE:
+        field = context.user_data.get("edit_field")
+        region_id = context.user_data.get("edit_region_id")
+        if field not in OPTIONAL_EDIT_FIELDS:
+            await update.message.reply_text("Це поле не можна очистити.")
+            return
+        tg_user = update.effective_user
+        async with async_session() as session:
+            region = await session.get(Region, region_id)
+            if not region:
+                await update.message.reply_text(
+                    "Регіон не знайдено.", reply_markup=_get_menu(context)
+                )
+                _set_state(context, STATE_IDLE)
+                context.user_data.pop("edit_field", None)
+                return
+            setattr(region, field, None)
+            if field == "link_doc":
+                region.doc_file_id = None
+                region.doc_etag = None
+            await session.commit()
+            region_name = region.name
+        await _log_action(
+            tg_user.id, tg_user.username, f"Очистив поле «{field}» регіону «{region_name}»"
+        )
+        await update.message.reply_text(
+            "Очищено! Оберіть поле для редагування:",
+            reply_markup=_edit_fields_keyboard(region_id),
+        )
+        _set_state(context, STATE_IDLE)
+        context.user_data.pop("edit_field", None)
+        return
+
+
+# ──────────────────────────────────────
 #  Region selection (public)
 # ──────────────────────────────────────
 async def region_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -210,19 +329,26 @@ async def region_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
 
     if data.startswith("regiongroup_"):
-        group_label = data.replace("regiongroup_", "", 1)
-        groups = await _load_region_groups()
-        prefix = groups.get(group_label, group_label)
+        group_id = int(data.replace("regiongroup_", "", 1))
         async with async_session() as session:
-            regions = (await session.execute(select(Region))).scalars().all()
-        sub_names = sorted(set(r.name for r in regions if r.name.startswith(prefix)))
+            group = await session.get(RegionGroup, group_id)
+            regions = (
+                await session.execute(
+                    select(Region).where(Region.group_id == group_id)
+                )
+            ).scalars().all()
+        if not group:
+            keyboard = await _build_start_keyboard()
+            await query.edit_message_text("Групу не знайдено.", reply_markup=keyboard)
+            return
+        sub_names = sorted(set(r.name for r in regions))
         buttons = [
             [InlineKeyboardButton(name, callback_data=f"regionname_{name}")]
             for name in sub_names
         ]
         buttons.append([InlineKeyboardButton("Назад", callback_data="region_back")])
         reply_markup = InlineKeyboardMarkup(buttons)
-        msg_text = f"Оберіть локацію в «{group_label}»:"
+        msg_text = f"Оберіть локацію в «{group.label}»:"
         if query.message.photo:
             await query.message.delete()
             await query.message.reply_text(msg_text, reply_markup=reply_markup)
@@ -238,7 +364,7 @@ async def region_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ).scalars().all()
         buttons = [
             [InlineKeyboardButton(
-                f"{r.name} — {r.price}$ — {r.size} сот.",
+                f"{r.name} — {r.price}$ — {_fmt_size(r.size)} сот.",
                 callback_data=f"regiondetail_{r.id}",
             )]
             for r in regions
@@ -280,22 +406,16 @@ async def region_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if is_privileged:
             text += f"Кількість ділянок: {region.plots_number}\n"
         text += (
-            f"Розмір: {region.size} сот.\n"
+            f"Розмір: {_fmt_size(region.size)} сот.\n"
             f"Опис: {region.describe or '—'}\n"
             f"{map_line}\n"
             f"{yt_line}"
         )
-        nav_buttons = []
-        if is_privileged and region.link_doc:
-            download_url = _gdrive_to_download(region.link_doc)
-            nav_buttons.append([InlineKeyboardButton(
-                "📄 Завантажити документ доступності", url=download_url
-            )])
-        nav_buttons.append([
+        nav_btn = InlineKeyboardMarkup([[
             InlineKeyboardButton("Назад", callback_data=f"regionname_{region.name}"),
+            InlineKeyboardButton("Забронювати", callback_data=f"regionbook_{region.id}"),
             InlineKeyboardButton("Головна", callback_data="region_back"),
-        ])
-        nav_btn = InlineKeyboardMarkup(nav_buttons)
+        ]])
         chat_id = query.message.chat_id
         await query.message.delete()
 
@@ -326,6 +446,10 @@ async def region_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 caption="Фото-схема ділянки",
             )
 
+        # Send accessibility document (cached via file_id when Drive file unchanged)
+        if is_privileged and region.link_doc:
+            await _send_region_doc(context.bot, chat_id, region)
+
         await context.bot.send_message(chat_id=chat_id, text="Оберіть дію:", reply_markup=nav_btn)
 
     elif data == "region_back":
@@ -336,6 +460,58 @@ async def region_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text(msg_text, reply_markup=keyboard)
         else:
             await query.edit_message_text(msg_text, reply_markup=keyboard)
+
+    elif data.startswith("regionbook_"):
+        await _handle_booking(query, context)
+
+
+async def _handle_booking(query, context):
+    """Forward a booking request to the configured contact and confirm to user."""
+    region_id = int(query.data.replace("regionbook_", ""))
+    tg_user = query.from_user
+
+    async with async_session() as session:
+        region = await session.get(Region, region_id)
+    if not region:
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text="Ділянку не знайдено. Спробуйте ще раз.",
+        )
+        return
+
+    username = f"@{tg_user.username}" if tg_user.username else "—"
+    full_name = " ".join(filter(None, [tg_user.first_name, tg_user.last_name])) or "—"
+    request_text = (
+        "🔔 Нова заявка на бронювання\n"
+        f"Від: {full_name} ({username}, id:{tg_user.id})\n"
+        f"Ділянка: {region.name} — {region.price}$ ({_fmt_size(region.size)} сот.)"
+    )
+
+    sent_ok = False
+    if BOOKING_CONTACT_ID:
+        try:
+            await context.bot.send_message(chat_id=BOOKING_CONTACT_ID, text=request_text)
+            sent_ok = True
+        except Exception as exc:
+            logger.warning("Booking forward failed: %s", exc)
+
+    if sent_ok:
+        await _log_action(
+            tg_user.id, tg_user.username, f"Заявка на бронювання «{region.name}»"
+        )
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text="✅ Заявку надіслано! Артем зв'яжеться з вами найближчим часом.",
+        )
+    else:
+        fallback_kb = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("Написати напряму", url=BOOKING_CONTACT_FALLBACK_URL)]]
+        )
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text="Не вдалося автоматично надіслати заявку. Напишіть, будь ласка, напряму:",
+            reply_markup=fallback_kb,
+        )
 
 
 # ──────────────────────────────────────
@@ -390,12 +566,25 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _handle_edit_pick_field(query, context)
     elif data.startswith("assigngroup_"):
         await _handle_assign_group(query, context)
+    elif data.startswith("delreg_"):
+        await _handle_delete_region_confirm(query, context)
+    elif data.startswith("delregyes_"):
+        await _handle_delete_region(query, context)
+    elif data.startswith("delregno_"):
+        region_id = int(data.replace("delregno_", ""))
+        await query.edit_message_text(
+            "Оберіть поле для редагування:", reply_markup=_edit_fields_keyboard(region_id)
+        )
     elif data in ("confirm_yes", "confirm_no"):
         await _handle_add_confirm(query, context)
     elif data == "addphoto_done":
+        await _show_add_group_picker(query, context)
+    elif data.startswith("addgroup_"):
+        raw = data.replace("addgroup_", "")
+        context.user_data["new_region"]["group_id"] = None if raw == "none" else int(raw)
         _set_state(context, STATE_IDLE)
         photos = context.user_data.get("new_region_photos", [])
-        summary = _region_summary(context.user_data.get("new_region", {}), photos)
+        summary = await _region_summary(context.user_data.get("new_region", {}), photos)
         await query.edit_message_text(f"Зберегти?\n\n{summary}", reply_markup=CONFIRM_KEYBOARD)
     elif data.startswith("photomgr_"):
         region_id = int(data.replace("photomgr_", ""))
@@ -435,7 +624,7 @@ async def _handle_admin_groups(query, context):
     buttons: list[list[InlineKeyboardButton]] = []
     for g in groups:
         buttons.append([
-            InlineKeyboardButton(f"{g.label} (префікс: {g.prefix})", callback_data=f"noop_group_{g.id}"),
+            InlineKeyboardButton(g.label, callback_data=f"noop_group_{g.id}"),
             InlineKeyboardButton("❌", callback_data=f"admin_group_del_{g.id}"),
         ])
     buttons.append([InlineKeyboardButton("➕ Додати групу", callback_data="admin_group_add")])
@@ -467,6 +656,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = await session.get(User, tg_user.id)
         if user and user.is_admin:
             context.user_data["role"] = "admin"
+            await update.message.reply_text("Режим адміністратора.", reply_markup=ADMIN_NAV_KEYBOARD)
             await update.message.reply_text("Панель адміністратора:", reply_markup=ADMIN_MENU)
             return
         if user and user.is_realtor:
@@ -488,7 +678,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _handle_admin_add(query, context):
     async with async_session() as session:
         user = await session.get(User, query.from_user.id)
-        if not user or (not user.is_admin and not user.is_realtor):
+        if not user or not user.is_admin:
             await query.edit_message_text("У вас немає прав адміністратора.")
             return
 
@@ -501,11 +691,9 @@ async def _handle_admin_add(query, context):
 async def _handle_admin_edit(query, context):
     async with async_session() as session:
         user = await session.get(User, query.from_user.id)
-        if not user or (not user.is_admin and not user.is_realtor):
+        if not user or not user.is_admin:
             await query.edit_message_text("У вас немає прав адміністратора.")
             return
-
-    async with async_session() as session:
         regions = (await session.execute(select(Region))).scalars().all()
     if not regions:
         await query.edit_message_text(
@@ -530,11 +718,9 @@ async def _handle_admin_edit(query, context):
 async def _handle_copy_list(query, context, copy_field: str):
     async with async_session() as session:
         user = await session.get(User, query.from_user.id)
-        if not user or (not user.is_admin and not user.is_realtor):
+        if not user or not user.is_admin:
             await query.edit_message_text("У вас немає прав адміністратора.")
             return
-
-    async with async_session() as session:
         regions = (await session.execute(select(Region))).scalars().all()
     if not regions:
         await query.edit_message_text(
@@ -548,7 +734,6 @@ async def _handle_copy_list(query, context, copy_field: str):
         )]
         for r in regions
     ]
-    back_cb = "admin_copy_price" if copy_field == "price" else "admin_copy_name"
     buttons.append([InlineKeyboardButton("Назад", callback_data="admin_back")])
     keyboard = InlineKeyboardMarkup(buttons)
     label = "ціною" if copy_field == "price" else "ім'ям"
@@ -580,7 +765,9 @@ async def _handle_copy_pick(query, context, copy_field: str):
             "describe": region.describe,
             "link_map": region.link_map,
             "link_youtube": region.link_youtube,
+            "link_doc": region.link_doc,
             "scheme_photo_id": region.scheme_photo_id,
+            "group_id": region.group_id,
         }
         context.user_data["new_region_photos"] = photo_ids
 
@@ -644,7 +831,9 @@ def _edit_fields_keyboard(region_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(label, callback_data=f"editfield_{field}")]
         for field, label in FIELD_LABELS.items()
     ]
+    buttons.append([InlineKeyboardButton("🖼 Фото", callback_data="editfield_photo_file_id")])
     buttons.append([InlineKeyboardButton("📁 Група", callback_data="editfield_group")])
+    buttons.append([InlineKeyboardButton("🗑 Видалити ділянку", callback_data=f"delreg_{region_id}")])
     buttons.append([InlineKeyboardButton("Назад", callback_data="admin_edit")])
     return InlineKeyboardMarkup(buttons)
 
@@ -656,6 +845,51 @@ async def _handle_edit_pick_region(query, context):
     await query.edit_message_text(
         "Оберіть поле для редагування:", reply_markup=_edit_fields_keyboard(region_id)
     )
+
+
+async def _handle_delete_region_confirm(query, context):
+    region_id = int(query.data.replace("delreg_", ""))
+    async with async_session() as session:
+        user = await session.get(User, query.from_user.id)
+        if not user or not user.is_admin:
+            await query.edit_message_text("У вас немає прав адміністратора.")
+            return
+        region = await session.get(Region, region_id)
+        if not region:
+            await query.edit_message_text("Регіон не знайдено.", reply_markup=_get_menu(context))
+            return
+        label = f"{region.name} — {region.price}$" if region.price else region.name
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Так, видалити", callback_data=f"delregyes_{region_id}"),
+            InlineKeyboardButton("Ні", callback_data=f"delregno_{region_id}"),
+        ]
+    ])
+    await query.edit_message_text(
+        f"Видалити ділянку «{label}»?\nЦю дію неможливо скасувати.",
+        reply_markup=keyboard,
+    )
+
+
+async def _handle_delete_region(query, context):
+    region_id = int(query.data.replace("delregyes_", ""))
+    async with async_session() as session:
+        user = await session.get(User, query.from_user.id)
+        if not user or not user.is_admin:
+            await query.edit_message_text("У вас немає прав адміністратора.")
+            return
+        region = await session.get(Region, region_id)
+        if not region:
+            await query.edit_message_text("Регіон не знайдено.", reply_markup=_get_menu(context))
+            return
+        name = region.name
+        await session.delete(region)
+        await session.commit()
+    await _log_action(
+        query.from_user.id, query.from_user.username, f"Видалив ділянку «{name}» (#{region_id})"
+    )
+    context.user_data.pop("edit_region_id", None)
+    await _handle_admin_edit(query, context)
 
 
 async def _handle_edit_pick_field(query, context):
@@ -676,7 +910,8 @@ async def _handle_edit_pick_field(query, context):
         return
     else:
         _set_state(context, STATE_EDIT_VALUE)
-        await query.edit_message_text(f"Введіть нове значення для '{label}':")
+        hint = " (або /skip щоб очистити)" if field in OPTIONAL_EDIT_FIELDS else ""
+        await query.edit_message_text(f"Введіть нове значення для '{label}'{hint}:")
 
 
 async def _handle_edit_group(query, context):
@@ -686,12 +921,7 @@ async def _handle_edit_group(query, context):
         region = await session.get(Region, region_id)
         groups = (await session.execute(select(RegionGroup))).scalars().all()
 
-    # Determine current group
-    current_group = None
-    for g in groups:
-        if region and region.name.startswith(g.prefix):
-            current_group = g
-            break
+    current_group = next((g for g in groups if region and g.id == region.group_id), None)
 
     buttons: list[list[InlineKeyboardButton]] = []
     for g in groups:
@@ -700,57 +930,53 @@ async def _handle_edit_group(query, context):
             f"{g.label}{marker}",
             callback_data=f"assigngroup_{g.id}",
         )])
+    none_marker = " ✅" if current_group is None else ""
+    buttons.append([InlineKeyboardButton(
+        f"Без групи{none_marker}", callback_data="assigngroup_none"
+    )])
     buttons.append([InlineKeyboardButton("Назад", callback_data=f"editreg_{region_id}")])
     current_text = f"Поточна група: «{current_group.label}»" if current_group else "Регіон не входить у жодну групу"
     await query.edit_message_text(
-        f"{current_text}\n\nОберіть групу, до якої додати «{region.name}»:",
+        f"{current_text}\n\nОберіть групу для «{region.name}»:",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
 
 
 async def _handle_assign_group(query, context):
-    """Rename a region to include the group prefix."""
-    group_id = int(query.data.replace("assigngroup_", ""))
+    """Set region.group_id without touching the name."""
+    raw = query.data.replace("assigngroup_", "")
+    new_group_id: int | None = None if raw == "none" else int(raw)
     region_id = context.user_data.get("edit_region_id")
+
     async with async_session() as session:
         region = await session.get(Region, region_id)
-        group = await session.get(RegionGroup, group_id)
-        if not region or not group:
-            await query.edit_message_text("Помилка: регіон або групу не знайдено.", reply_markup=_get_menu(context))
+        group = await session.get(RegionGroup, new_group_id) if new_group_id else None
+        if not region or (new_group_id is not None and not group):
+            await query.edit_message_text(
+                "Помилка: регіон або групу не знайдено.", reply_markup=_get_menu(context)
+            )
             return
 
-        # Check if already in this group
-        if region.name.startswith(group.prefix):
+        if region.group_id == new_group_id:
+            label = group.label if group else "без групи"
             await query.edit_message_text(
-                f"«{region.name}» вже входить у групу «{group.label}».\n\n"
-                f"Оберіть поле для редагування:",
+                f"«{region.name}» вже {label}.\n\nОберіть поле для редагування:",
                 reply_markup=_edit_fields_keyboard(region_id),
             )
             return
 
-        # Strip any existing group prefix from other groups
-        all_groups = (await session.execute(select(RegionGroup))).scalars().all()
-        clean_name = region.name
-        for g in all_groups:
-            if clean_name.startswith(g.prefix):
-                clean_name = clean_name[len(g.prefix):].lstrip("-– ")
-                break
-
-        # Build new name: prefix-cleanname
-        new_name = f"{group.prefix}-{clean_name}" if clean_name else group.prefix
-        old_name = region.name
-        region.name = new_name
+        region.group_id = new_group_id
+        region_name = region.name
         await session.commit()
 
+    label = group.label if group else "без групи"
     await _log_action(
         query.from_user.id,
         query.from_user.username,
-        f"Переніс «{old_name}» → «{new_name}» (група «{group.label}»)",
+        f"Змінив групу регіону «{region_name}» на «{label}»",
     )
-    region_id = context.user_data.get("edit_region_id")
     await query.edit_message_text(
-        f"Регіон перейменовано: «{old_name}» → «{new_name}»\n"
-        f"Тепер він входить у групу «{group.label}».\n\n"
+        f"Групу регіону «{region_name}» змінено на «{label}».\n\n"
         f"Оберіть поле для редагування:",
         reply_markup=_edit_fields_keyboard(region_id),
     )
@@ -799,11 +1025,21 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     if text == "Контакти":
+        nav_kb = await _nav_keyboard_for(update.effective_user.id)
         await update.message.reply_text(
             "Зв'яжіться з нами:\n"
             "https://t.me/dilyanki_odesa",
-            reply_markup=DEFAULT_NAV_KEYBOARD,
+            reply_markup=nav_kb,
         )
+        return
+    if text == "Адмін-панель":
+        async with async_session() as session:
+            user = await session.get(User, update.effective_user.id)
+        if not user or not user.is_admin:
+            return
+        _set_state(context, STATE_IDLE)
+        context.user_data["role"] = "admin"
+        await update.message.reply_text("Панель адміністратора:", reply_markup=ADMIN_MENU)
         return
 
     state = _get_state(context)
@@ -853,32 +1089,20 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _on_edit_value(update, context)
     elif state == STATE_GROUP_ADD_LABEL:
         await _on_group_add_label(update, context)
-    elif state == STATE_GROUP_ADD_PREFIX:
-        await _on_group_add_prefix(update, context)
 
 
 # ──────────────────────────────────────
 #  Group add steps
 # ──────────────────────────────────────
 async def _on_group_add_label(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["new_group_label"] = update.message.text.strip()
-    _set_state(context, STATE_GROUP_ADD_PREFIX)
-    await update.message.reply_text(
-        "Введіть префікс для пошуку ділянок (наприклад: Грюнсдорф).\n"
-        "Усі ділянки, назва яких починається з цього префіксу, потраплять у групу:"
-    )
-
-
-async def _on_group_add_prefix(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    label = context.user_data.pop("new_group_label", "")
-    prefix = update.message.text.strip()
+    label = update.message.text.strip()
     async with async_session() as session:
-        session.add(RegionGroup(label=label, prefix=prefix))
+        session.add(RegionGroup(label=label))
         await session.commit()
     await _log_action(
         update.effective_user.id,
         update.effective_user.username,
-        f"Додав групу «{label}» (префікс: {prefix})",
+        f"Додав групу «{label}»",
     )
     _set_state(context, STATE_IDLE)
     await update.message.reply_text(
@@ -902,12 +1126,16 @@ async def _on_login_password(update: Update, context: ContextTypes.DEFAULT_TYPE)
         _set_state(context, STATE_IDLE)
         context.user_data["role"] = "admin"
         await _log_action(tg_user.id, tg_user.username, "Увійшов як адмін")
-        await update.message.reply_text("Ви увійшли як адмін.", reply_markup=ADMIN_MENU)
+        await update.message.reply_text("Ви увійшли як адмін.", reply_markup=ADMIN_NAV_KEYBOARD)
+        await update.message.reply_text("Панель адміністратора:", reply_markup=ADMIN_MENU)
         return
 
     async with async_session() as session:
         realtors = (await session.execute(select(Realtor))).scalars().all()
-    matched = next((r for r in realtors if r.password == password), None)
+    matched = next(
+        (r for r in realtors if bcrypt.checkpw(password.encode(), r.password.encode())),
+        None,
+    )
     if matched:
         async with async_session() as session:
             user = await session.get(User, tg_user.id)
@@ -961,10 +1189,11 @@ async def _on_add_plots(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _on_add_size(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        context.user_data["new_region"]["size"] = int(update.message.text.strip())
-    except ValueError:
-        await update.message.reply_text("Невірний формат. Введіть ціле число:")
+        size = Decimal(update.message.text.strip().replace(",", "."))
+    except InvalidOperation:
+        await update.message.reply_text("Невірний формат. Введіть число:")
         return
+    context.user_data["new_region"]["size"] = size
     _set_state(context, STATE_ADD_DESCRIBE)
     await update.message.reply_text("Введіть опис (або /skip):")
 
@@ -1003,19 +1232,43 @@ async def _on_add_link_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-def _region_summary(data: dict, photos: list | None = None) -> str:
+async def _region_summary(data: dict, photos: list | None = None) -> str:
     count = len(photos) if photos else 0
     photo_str = f"є ({count} шт.)" if count else "немає"
+    group_label = "—"
+    gid = data.get("group_id")
+    if gid is not None:
+        async with async_session() as session:
+            g = await session.get(RegionGroup, gid)
+            if g:
+                group_label = g.label
     return (
         f"Назва: {data.get('name', '—')}\n"
         f"Ціна: {data.get('price', '—')}\n"
         f"Кількість ділянок: {data.get('plots_number', '—')}\n"
-        f"Розмір (сотки): {data.get('size', 5)}\n"
+        f"Розмір (сотки): {_fmt_size(data.get('size', 5))}\n"
         f"Опис: {data.get('describe') or '—'}\n"
         f"Карта: {data.get('link_map') or '—'}\n"
         f"YouTube: {data.get('link_youtube') or '—'}\n"
         f"Документ доступності: {data.get('link_doc') or '—'}\n"
+        f"Група: {group_label}\n"
         f"Фото: {photo_str}"
+    )
+
+
+async def _show_add_group_picker(query, context):
+    """Show group selection buttons for the region being added."""
+    _set_state(context, STATE_ADD_GROUP)
+    async with async_session() as session:
+        groups = (await session.execute(select(RegionGroup))).scalars().all()
+    buttons: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(g.label, callback_data=f"addgroup_{g.id}")]
+        for g in sorted(groups, key=lambda x: x.label)
+    ]
+    buttons.append([InlineKeyboardButton("Без групи", callback_data="addgroup_none")])
+    await query.edit_message_text(
+        "Оберіть групу для регіону:",
+        reply_markup=InlineKeyboardMarkup(buttons),
     )
 
 
@@ -1031,7 +1284,7 @@ async def _on_copy_new_price(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data["new_region"]["price"] = price
     _set_state(context, STATE_IDLE)
     photos = context.user_data.get("new_region_photos", [])
-    summary = _region_summary(context.user_data["new_region"], photos)
+    summary = await _region_summary(context.user_data["new_region"], photos)
     await update.message.reply_text(
         f"Зберегти?\n\n{summary}", reply_markup=CONFIRM_KEYBOARD
     )
@@ -1041,7 +1294,7 @@ async def _on_copy_new_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["new_region"]["name"] = update.message.text.strip()
     _set_state(context, STATE_IDLE)
     photos = context.user_data.get("new_region_photos", [])
-    summary = _region_summary(context.user_data["new_region"], photos)
+    summary = await _region_summary(context.user_data["new_region"], photos)
     await update.message.reply_text(
         f"Зберегти?\n\n{summary}", reply_markup=CONFIRM_KEYBOARD
     )
@@ -1055,13 +1308,13 @@ async def _on_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     region_id = context.user_data.get("edit_region_id")
     raw = update.message.text.strip()
 
-    if field == "price":
+    if field in ("price", "size"):
         try:
             value = Decimal(raw.replace(",", "."))
         except InvalidOperation:
             await update.message.reply_text("Невірний формат. Введіть число:")
             return
-    elif field in ("plots_number", "size"):
+    elif field == "plots_number":
         try:
             value = int(raw)
         except ValueError:
@@ -1075,6 +1328,9 @@ async def _on_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
         region = await session.get(Region, region_id)
         if region:
             setattr(region, field, value)
+            if field == "link_doc":
+                region.doc_file_id = None
+                region.doc_etag = None
             await session.commit()
             await _log_action(
                 tg_user.id,
@@ -1108,15 +1364,16 @@ async def _on_create_realtor_password(update: Update, context: ContextTypes.DEFA
     password = update.message.text.strip()
     tg_user = update.effective_user
 
+    hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
     async with async_session() as session:
-        realtor = Realtor(name=name, password=password, created_by=tg_user.id)
+        realtor = Realtor(name=name, password=hashed, created_by=tg_user.id)
         session.add(realtor)
         await session.commit()
 
     _set_state(context, STATE_IDLE)
     await _log_action(tg_user.id, tg_user.username, f"Створив ріелтора «{name}»")
     await update.message.reply_text(
-        f"Ріелтор «{name}» створений.\nПароль: {password}",
+        f"Ріелтор «{name}» створений.",
         reply_markup=ADMIN_MENU,
     )
 

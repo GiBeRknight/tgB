@@ -54,10 +54,15 @@ class Region(Base):
     plots_number: Mapped[int] = mapped_column(Integer)
     describe: Mapped[str | None] = mapped_column(Text, nullable=True)
     link_map: Mapped[str | None] = mapped_column(String(500), nullable=True)
-    size: Mapped[int] = mapped_column(Integer, default=5)
+    size: Mapped[float] = mapped_column(Numeric(10, 2), default=5)
     link_youtube: Mapped[str | None] = mapped_column(String(500), nullable=True)
     link_doc: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    doc_file_id: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    doc_etag: Mapped[str | None] = mapped_column(String(255), nullable=True)
     scheme_photo_id: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    group_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("region_groups.id", ondelete="SET NULL"), nullable=True
+    )
 
 
 class RegionGroup(Base):
@@ -65,7 +70,7 @@ class RegionGroup(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     label: Mapped[str] = mapped_column(String(255), unique=True)
-    prefix: Mapped[str] = mapped_column(String(255))
+    prefix: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
 
 class RegionPhoto(Base):

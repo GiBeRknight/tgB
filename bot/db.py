@@ -37,6 +37,11 @@ async def init_db():
         "ALTER TABLE region_photos ADD COLUMN IF NOT EXISTS file_type VARCHAR(20) DEFAULT 'photo'",
         "ALTER TABLE regions ADD COLUMN IF NOT EXISTS scheme_photo_id VARCHAR(500) DEFAULT NULL",
         "ALTER TABLE regions ADD COLUMN IF NOT EXISTS link_doc VARCHAR(500) DEFAULT NULL",
+        "ALTER TABLE regions ADD COLUMN IF NOT EXISTS group_id INTEGER REFERENCES region_groups(id) ON DELETE SET NULL",
+        "ALTER TABLE region_groups ALTER COLUMN prefix DROP NOT NULL",
+        "ALTER TABLE regions ALTER COLUMN size TYPE NUMERIC(10, 2) USING size::numeric",
+        "ALTER TABLE regions ADD COLUMN IF NOT EXISTS doc_file_id VARCHAR(500) DEFAULT NULL",
+        "ALTER TABLE regions ADD COLUMN IF NOT EXISTS doc_etag VARCHAR(255) DEFAULT NULL",
     ]
     for stmt in alter_statements:
         try:
@@ -54,13 +59,28 @@ async def init_db():
     except Exception as exc:
         logger.warning("Index creation failed: %s", exc)
 
+    # One-time migration: populate group_id from legacy name prefixes
+    try:
+        async with engine.begin() as conn:
+            result = await conn.execute(text(
+                "UPDATE regions r SET group_id = g.id "
+                "FROM region_groups g "
+                "WHERE r.group_id IS NULL "
+                "  AND g.prefix IS NOT NULL "
+                "  AND r.name LIKE g.prefix || '%'"
+            ))
+            if result.rowcount:
+                logger.info("Backfilled group_id for %d regions", result.rowcount)
+    except Exception as exc:
+        logger.warning("group_id backfill skipped: %s", exc)
+
     # Seed default region groups if table is empty
     try:
         from bot.models import RegionGroup
         async with async_session() as session:
             count = (await session.execute(text("SELECT count(*) FROM region_groups"))).scalar()
             if count == 0:
-                session.add(RegionGroup(label="Грюнсдорф", prefix="Грюнсдорф"))
+                session.add(RegionGroup(label="Грюнсдорф"))
                 await session.commit()
                 logger.info("Seeded default region group 'Грюнсдорф'")
     except Exception as exc:
