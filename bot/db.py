@@ -42,6 +42,23 @@ async def init_db():
         "ALTER TABLE regions ALTER COLUMN size TYPE NUMERIC(10, 2) USING size::numeric",
         "ALTER TABLE regions ADD COLUMN IF NOT EXISTS doc_file_id VARCHAR(500) DEFAULT NULL",
         "ALTER TABLE regions ADD COLUMN IF NOT EXISTS doc_etag VARCHAR(255) DEFAULT NULL",
+        # Allow nullable user references on logs / realtor credentials before adding FKs
+        "ALTER TABLE action_logs ALTER COLUMN user_id DROP NOT NULL",
+        "ALTER TABLE realtors ALTER COLUMN created_by DROP NOT NULL",
+        # Orphan cleanup so FK creation can succeed
+        "UPDATE action_logs SET user_id = NULL "
+        "WHERE user_id IS NOT NULL AND user_id NOT IN (SELECT id FROM users)",
+        "UPDATE realtors SET created_by = NULL "
+        "WHERE created_by IS NOT NULL AND created_by NOT IN (SELECT id FROM users)",
+        # Add FK constraints (idempotent via exception block, duplicates are ignored)
+        "DO $$ BEGIN "
+        "ALTER TABLE action_logs ADD CONSTRAINT fk_action_logs_user_id "
+        "FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL; "
+        "EXCEPTION WHEN duplicate_object THEN NULL; END $$",
+        "DO $$ BEGIN "
+        "ALTER TABLE realtors ADD CONSTRAINT fk_realtors_created_by "
+        "FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL; "
+        "EXCEPTION WHEN duplicate_object THEN NULL; END $$",
     ]
     for stmt in alter_statements:
         try:
@@ -49,15 +66,18 @@ async def init_db():
                 await conn.execute(text(stmt))
         except Exception as exc:
             logger.warning("ALTER failed: %s — %s", stmt, exc)
-    # Create index for fast region name lookups
-    try:
-        async with engine.begin() as conn:
-            await conn.execute(
-                text("CREATE INDEX IF NOT EXISTS idx_regions_name ON regions(name)")
-            )
-        logger.info("Index idx_regions_name ensured")
-    except Exception as exc:
-        logger.warning("Index creation failed: %s", exc)
+    # Create indexes for fast lookups
+    index_statements = [
+        "CREATE INDEX IF NOT EXISTS idx_regions_name ON regions(name)",
+        "CREATE INDEX IF NOT EXISTS idx_regions_group_id ON regions(group_id)",
+        "CREATE INDEX IF NOT EXISTS idx_region_photos_region_id ON region_photos(region_id)",
+    ]
+    for stmt in index_statements:
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(text(stmt))
+        except Exception as exc:
+            logger.warning("Index creation failed: %s — %s", stmt, exc)
 
     # One-time migration: populate group_id from legacy name prefixes
     try:
