@@ -42,6 +42,7 @@ async def init_db():
         "ALTER TABLE regions ALTER COLUMN size TYPE NUMERIC(10, 2) USING size::numeric",
         "ALTER TABLE regions ADD COLUMN IF NOT EXISTS doc_file_id VARCHAR(500) DEFAULT NULL",
         "ALTER TABLE regions ADD COLUMN IF NOT EXISTS doc_etag VARCHAR(255) DEFAULT NULL",
+        "ALTER TABLE regions ADD COLUMN IF NOT EXISTS doc_preview_file_id VARCHAR(500) DEFAULT NULL",
         # Allow nullable user references on logs / realtor credentials before adding FKs
         "ALTER TABLE action_logs ALTER COLUMN user_id DROP NOT NULL",
         "ALTER TABLE realtors ALTER COLUMN created_by DROP NOT NULL",

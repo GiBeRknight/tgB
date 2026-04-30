@@ -1,5 +1,10 @@
+import asyncio
+import io
 import logging
+import os
 import re
+import shutil
+import tempfile
 import time
 import bcrypt
 import httpx
@@ -190,42 +195,121 @@ async def _fetch_drive_etag(url: str) -> str | None:
         return None
 
 
+def _render_xlsx_preview_sync(xlsx_bytes: bytes) -> bytes | None:
+    """Render the first sheet of an xlsx file to JPEG bytes via LibreOffice + poppler."""
+    from pdf2image import convert_from_path
+
+    workdir = tempfile.mkdtemp(prefix="xlsx_preview_")
+    try:
+        src_path = os.path.join(workdir, "doc.xlsx")
+        with open(src_path, "wb") as f:
+            f.write(xlsx_bytes)
+
+        result = os.system(
+            f"soffice --headless --convert-to pdf --outdir {workdir} {src_path} >/dev/null 2>&1"
+        )
+        pdf_path = os.path.join(workdir, "doc.pdf")
+        if result != 0 or not os.path.exists(pdf_path):
+            logger.warning("LibreOffice conversion failed for xlsx preview")
+            return None
+
+        images = convert_from_path(pdf_path, dpi=150, first_page=1, last_page=1)
+        if not images:
+            return None
+
+        buf = io.BytesIO()
+        images[0].convert("RGB").save(buf, format="JPEG", quality=85, optimize=True)
+        return buf.getvalue()
+    except Exception as exc:
+        logger.warning("xlsx preview render failed: %s", exc)
+        return None
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+async def _render_xlsx_preview(download_url: str) -> bytes | None:
+    """Download xlsx from Drive and render its first page as JPEG."""
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
+            r = await client.get(download_url)
+            r.raise_for_status()
+            xlsx_bytes = r.content
+    except Exception as exc:
+        logger.warning("xlsx download for preview failed: %s", exc)
+        return None
+    return await asyncio.to_thread(_render_xlsx_preview_sync, xlsx_bytes)
+
+
 async def _send_region_doc(bot, chat_id: int, region: Region) -> None:
-    """Send the accessibility document, using cached Telegram file_id when possible."""
+    """Send the accessibility document plus a JPEG preview of its first page."""
     if not region.link_doc:
         return
     download_url = _gdrive_to_download(region.link_doc)
     current_etag = await _fetch_drive_etag(download_url)
 
-    # Fast path: etag matches cache → send by file_id
-    if region.doc_file_id and current_etag and current_etag == region.doc_etag:
+    cache_valid = bool(current_etag) and current_etag == region.doc_etag
+
+    # Send preview (first page as JPEG)
+    new_preview_file_id: str | None = None
+    if cache_valid and region.doc_preview_file_id:
+        try:
+            await bot.send_photo(
+                chat_id=chat_id,
+                photo=region.doc_preview_file_id,
+                caption="📄 Документ доступності (превʼю)",
+            )
+        except Exception as exc:
+            logger.warning("Cached preview send failed for region %s: %s", region.id, exc)
+            cache_valid = False
+
+    if not cache_valid or not region.doc_preview_file_id:
+        preview_bytes = await _render_xlsx_preview(download_url)
+        if preview_bytes:
+            try:
+                msg = await bot.send_photo(
+                    chat_id=chat_id,
+                    photo=preview_bytes,
+                    caption="📄 Документ доступності (превʼю)",
+                )
+                if msg and msg.photo:
+                    new_preview_file_id = msg.photo[-1].file_id
+            except Exception as exc:
+                logger.warning("Preview send failed for region %s: %s", region.id, exc)
+
+    # Send the original document (cached file_id when Drive file unchanged)
+    new_doc_file_id: str | None = None
+    sent_doc = False
+    if cache_valid and region.doc_file_id:
         try:
             await bot.send_document(
                 chat_id=chat_id,
                 document=region.doc_file_id,
                 caption="📄 Документ доступності",
             )
-            return
+            sent_doc = True
         except Exception as exc:
             logger.warning("Cached file_id send failed for region %s: %s", region.id, exc)
 
-    # Full path: send by URL, capture new file_id
-    try:
-        msg = await bot.send_document(
-            chat_id=chat_id,
-            document=download_url,
-            caption="📄 Документ доступності",
-        )
-    except Exception as exc:
-        logger.warning("Doc send failed for region %s: %s", region.id, exc)
-        return
+    if not sent_doc:
+        try:
+            msg = await bot.send_document(
+                chat_id=chat_id,
+                document=download_url,
+                caption="📄 Документ доступності",
+            )
+            if msg and msg.document:
+                new_doc_file_id = msg.document.file_id
+        except Exception as exc:
+            logger.warning("Doc send failed for region %s: %s", region.id, exc)
 
-    new_file_id = msg.document.file_id if msg and msg.document else None
-    if new_file_id:
+    if new_doc_file_id or new_preview_file_id:
         async with async_session() as session:
             fresh = await session.get(Region, region.id)
             if fresh:
-                fresh.doc_file_id = new_file_id
+                if new_doc_file_id:
+                    fresh.doc_file_id = new_doc_file_id
+                if new_preview_file_id:
+                    fresh.doc_preview_file_id = new_preview_file_id
                 fresh.doc_etag = current_etag
                 await session.commit()
 
