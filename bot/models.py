@@ -63,6 +63,7 @@ class Region(Base):
     link_doc: Mapped[str | None] = mapped_column(String(500), nullable=True)
     doc_file_id: Mapped[str | None] = mapped_column(String(500), nullable=True)
     doc_etag: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    doc_preview_file_id: Mapped[str | None] = mapped_column(String(500), nullable=True)
     scheme_photo_id: Mapped[str | None] = mapped_column(String(500), nullable=True)
     group_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("region_groups.id", ondelete="SET NULL"), nullable=True
