@@ -2,7 +2,6 @@ import logging
 import re
 import time
 import bcrypt
-import httpx
 from decimal import Decimal, InvalidOperation
 
 from sqlalchemy import select
@@ -178,27 +177,12 @@ ADMIN_STATES: set[str] = {
 }
 
 
-async def _fetch_drive_etag(url: str) -> str | None:
-    """Return an identifier (ETag or Content-Length) for the file at the URL, or None."""
-    try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client:
-            r = await client.head(url)
-        etag = r.headers.get("etag") or r.headers.get("content-length")
-        return etag
-    except Exception as exc:
-        logger.warning("HEAD %s failed: %s", url, exc)
-        return None
-
-
 async def _send_region_doc(bot, chat_id: int, region: Region) -> None:
-    """Send the accessibility document, using cached Telegram file_id when possible."""
+    """Send the accessibility document, reusing cached Telegram file_id when available."""
     if not region.link_doc:
         return
-    download_url = _gdrive_to_download(region.link_doc)
-    current_etag = await _fetch_drive_etag(download_url)
 
-    # Fast path: etag matches cache → send by file_id
-    if region.doc_file_id and current_etag and current_etag == region.doc_etag:
+    if region.doc_file_id:
         try:
             await bot.send_document(
                 chat_id=chat_id,
@@ -209,7 +193,7 @@ async def _send_region_doc(bot, chat_id: int, region: Region) -> None:
         except Exception as exc:
             logger.warning("Cached file_id send failed for region %s: %s", region.id, exc)
 
-    # Full path: send by URL, capture new file_id
+    download_url = _gdrive_to_download(region.link_doc)
     try:
         msg = await bot.send_document(
             chat_id=chat_id,
@@ -226,7 +210,6 @@ async def _send_region_doc(bot, chat_id: int, region: Region) -> None:
             fresh = await session.get(Region, region.id)
             if fresh:
                 fresh.doc_file_id = new_file_id
-                fresh.doc_etag = current_etag
                 await session.commit()
 
 
@@ -335,7 +318,6 @@ async def skip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             setattr(region, field, None)
             if field == "link_doc":
                 region.doc_file_id = None
-                region.doc_etag = None
             await session.commit()
             region_name = region.name
         await _log_action(
@@ -1502,7 +1484,6 @@ async def _on_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
             setattr(region, field, value)
             if field == "link_doc":
                 region.doc_file_id = None
-                region.doc_etag = None
             await session.commit()
             await _log_action(
                 tg_user.id,
