@@ -3,7 +3,7 @@ import os
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")
 BOOKING_CONTACT_ID = int(os.environ["BOOKING_CONTACT_ID"]) if os.environ.get("BOOKING_CONTACT_ID") else None
-BOOKING_CONTACT_FALLBACK_URL = os.environ.get("BOOKING_CONTACT_FALLBACK_URL", "https://t.me/artem_zubr")
+BOOKING_CONTACT_FALLBACK_URL = os.environ.get("BOOKING_CONTACT_FALLBACK_URL", "tg://user?id=1746576470")
 
 DB_HOST = os.environ.get("DB_HOST", "db")
 DB_PORT = os.environ.get("DB_PORT", "5432")
