@@ -19,6 +19,7 @@ services:
     environment:
       BOT_TOKEN: ${BOT_TOKEN}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin123}
+      BOOKING_CONTACT_ID: ${BOOKING_CONTACT_ID:-1746576470}
       DB_HOST: db
       DB_PORT: 5432
       DB_USER: bot
