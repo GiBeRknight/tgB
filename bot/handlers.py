@@ -267,17 +267,49 @@ def _render_xlsx_preview_sync(xlsx_bytes: bytes) -> bytes | None:
         shutil.rmtree(profile_dir, ignore_errors=True)
 
 
-async def _render_xlsx_preview(download_url: str) -> bytes | None:
-    """Download xlsx from Drive and render its first page as JPEG."""
+async def _download_drive_file(download_url: str) -> bytes | None:
+    """Fetch a Google Drive file, transparently handling the virus-scan confirm page."""
     try:
         async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
             r = await client.get(download_url)
             r.raise_for_status()
-            xlsx_bytes = r.content
+            content = r.content
+
+            # Drive returns an HTML interstitial for files >~25MB. Extract the
+            # confirm token (modern: form action with `confirm=...`; legacy:
+            # `download_warning` cookie) and re-issue the request.
+            ct = r.headers.get("content-type", "")
+            if "html" in ct.lower() or content[:16].lstrip().startswith(b"<"):
+                token = None
+                m = re.search(rb'name="confirm"\s+value="([^"]+)"', content)
+                if m:
+                    token = m.group(1).decode()
+                if not token:
+                    for name, value in client.cookies.items():
+                        if name.startswith("download_warning"):
+                            token = value
+                            break
+                if not token:
+                    logger.warning(
+                        "Drive returned HTML and no confirm token found (url=%s)",
+                        download_url,
+                    )
+                    return None
+
+                sep = "&" if "?" in download_url else "?"
+                r = await client.get(f"{download_url}{sep}confirm={token}")
+                r.raise_for_status()
+                content = r.content
+
+            if not content.startswith(b"PK"):
+                logger.warning(
+                    "Drive payload is not a zip after confirm (got %r...)", content[:16]
+                )
+                return None
+            return content
     except Exception as exc:
-        logger.warning("xlsx download for preview failed: %s", exc)
+        logger.warning("Drive download failed: %s", exc)
         return None
-    return await asyncio.to_thread(_render_xlsx_preview_sync, xlsx_bytes)
 
 
 async def _send_region_doc(bot, chat_id: int, region: Region) -> None:
@@ -289,62 +321,64 @@ async def _send_region_doc(bot, chat_id: int, region: Region) -> None:
 
     cache_valid = bool(current_etag) and current_etag == region.doc_etag
 
-    # Send preview (first page as JPEG)
-    new_preview_file_id: str | None = None
-    if cache_valid and region.doc_preview_file_id:
+    # Fast path: both preview and doc are cached and Drive file unchanged.
+    if cache_valid and region.doc_preview_file_id and region.doc_file_id:
+        preview_ok = False
         try:
             await bot.send_photo(
                 chat_id=chat_id,
                 photo=region.doc_preview_file_id,
                 caption="📄 Документ доступності (превʼю)",
             )
+            preview_ok = True
         except Exception as exc:
             logger.warning("Cached preview send failed for region %s: %s", region.id, exc)
-            cache_valid = False
-
-    if not cache_valid or not region.doc_preview_file_id:
-        try:
-            preview_bytes = await _render_xlsx_preview(download_url)
-        except Exception as exc:
-            logger.warning("Preview render crashed for region %s: %s", region.id, exc)
-            preview_bytes = None
-        if preview_bytes:
-            try:
-                msg = await bot.send_photo(
-                    chat_id=chat_id,
-                    photo=preview_bytes,
-                    caption="📄 Документ доступності (превʼю)",
-                )
-                if msg and msg.photo:
-                    new_preview_file_id = msg.photo[-1].file_id
-            except Exception as exc:
-                logger.warning("Preview send failed for region %s: %s", region.id, exc)
-
-    # Send the original document (cached file_id when Drive file unchanged)
-    new_doc_file_id: str | None = None
-    sent_doc = False
-    if cache_valid and region.doc_file_id:
         try:
             await bot.send_document(
                 chat_id=chat_id,
                 document=region.doc_file_id,
                 caption="📄 Документ доступності",
             )
-            sent_doc = True
+            if preview_ok:
+                return
         except Exception as exc:
-            logger.warning("Cached file_id send failed for region %s: %s", region.id, exc)
+            logger.warning("Cached doc send failed for region %s: %s", region.id, exc)
 
-    if not sent_doc:
+    # Slow path: download bytes once, use for both preview and document.
+    xlsx_bytes = await _download_drive_file(download_url)
+    if not xlsx_bytes:
+        return
+
+    new_preview_file_id: str | None = None
+    try:
+        preview_bytes = await asyncio.to_thread(_render_xlsx_preview_sync, xlsx_bytes)
+    except Exception as exc:
+        logger.warning("Preview render crashed for region %s: %s", region.id, exc)
+        preview_bytes = None
+    if preview_bytes:
         try:
-            msg = await bot.send_document(
+            msg = await bot.send_photo(
                 chat_id=chat_id,
-                document=download_url,
-                caption="📄 Документ доступності",
+                photo=preview_bytes,
+                caption="📄 Документ доступності (превʼю)",
             )
-            if msg and msg.document:
-                new_doc_file_id = msg.document.file_id
+            if msg and msg.photo:
+                new_preview_file_id = msg.photo[-1].file_id
         except Exception as exc:
-            logger.warning("Doc send failed for region %s: %s", region.id, exc)
+            logger.warning("Preview send failed for region %s: %s", region.id, exc)
+
+    new_doc_file_id: str | None = None
+    try:
+        msg = await bot.send_document(
+            chat_id=chat_id,
+            document=xlsx_bytes,
+            filename="accessibility.xlsx",
+            caption="📄 Документ доступності",
+        )
+        if msg and msg.document:
+            new_doc_file_id = msg.document.file_id
+    except Exception as exc:
+        logger.warning("Doc send failed for region %s: %s", region.id, exc)
 
     if new_doc_file_id or new_preview_file_id:
         async with async_session() as session:
