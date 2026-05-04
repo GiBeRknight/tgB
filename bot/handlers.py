@@ -190,9 +190,16 @@ async def _fetch_drive_etag(url: str) -> str | None:
         async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client:
             r = await client.head(url)
         etag = r.headers.get("etag") or r.headers.get("content-length")
+        logger.info(
+            "[doc] HEAD %s status=%s etag=%r ct=%s",
+            url,
+            r.status_code,
+            etag,
+            r.headers.get("content-type"),
+        )
         return etag
     except Exception as exc:
-        logger.warning("HEAD %s failed: %s", url, exc)
+        logger.warning("[doc] HEAD failed url=%s: %s", url, exc)
         return None
 
 
@@ -278,16 +285,24 @@ async def _download_drive_file(download_url: str, kind: str = "xlsx") -> bytes |
     /export suffix) are rejected.
     """
     expected_magic = _MAGIC.get(kind, b"")
+    logger.info("[doc] downloading kind=%s url=%s", kind, download_url)
     try:
         async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
             r = await client.get(download_url)
             r.raise_for_status()
             content = r.content
+            ct = r.headers.get("content-type", "")
+            logger.info(
+                "[doc] GET status=%s ct=%s bytes=%d head=%r",
+                r.status_code,
+                ct,
+                len(content),
+                content[:16],
+            )
 
             # Drive returns an HTML interstitial for files >~25MB. Extract the
             # confirm token (modern: form action with `confirm=...`; legacy:
             # `download_warning` cookie) and re-issue the request.
-            ct = r.headers.get("content-type", "")
             if "html" in ct.lower() or content[:16].lstrip().startswith(b"<"):
                 token = None
                 m = re.search(rb'name="confirm"\s+value="([^"]+)"', content)
@@ -300,26 +315,39 @@ async def _download_drive_file(download_url: str, kind: str = "xlsx") -> bytes |
                             break
                 if not token:
                     logger.warning(
-                        "Drive returned HTML and no confirm token found (url=%s)",
+                        "[doc] Drive returned HTML and no confirm token found "
+                        "(url=%s, ct=%s, body[:200]=%r)",
                         download_url,
+                        ct,
+                        content[:200],
                     )
                     return None
 
+                logger.info("[doc] following confirm token=%s", token)
                 sep = "&" if "?" in download_url else "?"
                 r = await client.get(f"{download_url}{sep}confirm={token}")
                 r.raise_for_status()
                 content = r.content
+                logger.info(
+                    "[doc] confirm GET status=%s bytes=%d head=%r",
+                    r.status_code,
+                    len(content),
+                    content[:16],
+                )
 
             if expected_magic and not content.startswith(expected_magic):
                 logger.warning(
-                    "Drive payload magic mismatch for kind=%s (got %r...)",
+                    "[doc] payload magic mismatch kind=%s expected=%r got=%r len=%d",
                     kind,
+                    expected_magic,
                     content[:16],
+                    len(content),
                 )
                 return None
+            logger.info("[doc] downloaded kind=%s bytes=%d", kind, len(content))
             return content
     except Exception as exc:
-        logger.warning("Drive download failed: %s", exc)
+        logger.warning("[doc] download failed url=%s: %s", download_url, exc)
         return None
 
 
@@ -344,15 +372,35 @@ def _render_pdf_preview_sync(pdf_bytes: bytes) -> bytes | None:
 
 async def _send_region_doc(bot, chat_id: int, region: Region) -> None:
     """Send the accessibility document plus a JPEG preview of its first page."""
+    rid = region.id
     if not region.link_doc:
+        logger.info("[doc r=%s] skipped: region has no link_doc", rid)
         return
     xlsx_url, pdf_url = _gdrive_export_urls(region.link_doc)
+    logger.info(
+        "[doc r=%s] start link=%s xlsx_url=%s pdf_url=%s",
+        rid,
+        region.link_doc,
+        xlsx_url,
+        pdf_url,
+    )
     current_etag = await _fetch_drive_etag(xlsx_url)
 
     cache_valid = bool(current_etag) and current_etag == region.doc_etag
+    logger.info(
+        "[doc r=%s] cache_valid=%s current_etag=%r stored_etag=%r "
+        "doc_file_id=%s preview_file_id=%s",
+        rid,
+        cache_valid,
+        current_etag,
+        region.doc_etag,
+        bool(region.doc_file_id),
+        bool(region.doc_preview_file_id),
+    )
 
     # Fast path: both preview and doc are cached and source unchanged.
     if cache_valid and region.doc_preview_file_id and region.doc_file_id:
+        logger.info("[doc r=%s] using cached file_ids", rid)
         preview_ok = False
         try:
             await bot.send_photo(
@@ -361,27 +409,32 @@ async def _send_region_doc(bot, chat_id: int, region: Region) -> None:
                 caption="📄 Документ доступності (превʼю)",
             )
             preview_ok = True
+            logger.info("[doc r=%s] cached preview sent", rid)
         except Exception as exc:
-            logger.warning("Cached preview send failed for region %s: %s", region.id, exc)
+            logger.warning("[doc r=%s] cached preview send failed: %s", rid, exc)
         try:
             await bot.send_document(
                 chat_id=chat_id,
                 document=region.doc_file_id,
                 caption="📄 Документ доступності",
             )
+            logger.info("[doc r=%s] cached doc sent", rid)
             if preview_ok:
                 return
         except Exception as exc:
-            logger.warning("Cached doc send failed for region %s: %s", region.id, exc)
+            logger.warning("[doc r=%s] cached doc send failed: %s", rid, exc)
 
     # Slow path: download bytes once, use for both preview and document.
+    logger.info("[doc r=%s] entering slow path", rid)
     xlsx_bytes = await _download_drive_file(xlsx_url, kind="xlsx")
     if not xlsx_bytes:
+        logger.warning("[doc r=%s] xlsx download returned no bytes — abort", rid)
         return
 
     # Prefer the native PDF export (Google Sheets) — skips LibreOffice entirely.
     new_preview_file_id: str | None = None
     preview_bytes: bytes | None = None
+    preview_source: str | None = None
     if pdf_url:
         pdf_bytes = await _download_drive_file(pdf_url, kind="pdf")
         if pdf_bytes:
@@ -389,15 +442,30 @@ async def _send_region_doc(bot, chat_id: int, region: Region) -> None:
                 preview_bytes = await asyncio.to_thread(
                     _render_pdf_preview_sync, pdf_bytes
                 )
+                if preview_bytes:
+                    preview_source = "sheets-pdf"
             except Exception as exc:
-                logger.warning("PDF preview crashed for region %s: %s", region.id, exc)
+                logger.warning("[doc r=%s] PDF preview crashed: %s", rid, exc)
+        else:
+            logger.info("[doc r=%s] PDF export download returned no bytes", rid)
 
     if preview_bytes is None:
+        logger.info("[doc r=%s] falling back to LibreOffice preview", rid)
         try:
             preview_bytes = await asyncio.to_thread(_render_xlsx_preview_sync, xlsx_bytes)
+            if preview_bytes:
+                preview_source = "libreoffice"
         except Exception as exc:
-            logger.warning("xlsx preview crashed for region %s: %s", region.id, exc)
+            logger.warning("[doc r=%s] xlsx preview crashed: %s", rid, exc)
             preview_bytes = None
+
+    logger.info(
+        "[doc r=%s] preview ready=%s source=%s bytes=%s",
+        rid,
+        bool(preview_bytes),
+        preview_source,
+        len(preview_bytes) if preview_bytes else 0,
+    )
 
     if preview_bytes:
         try:
@@ -408,8 +476,9 @@ async def _send_region_doc(bot, chat_id: int, region: Region) -> None:
             )
             if msg and msg.photo:
                 new_preview_file_id = msg.photo[-1].file_id
+            logger.info("[doc r=%s] preview sent file_id=%s", rid, new_preview_file_id)
         except Exception as exc:
-            logger.warning("Preview send failed for region %s: %s", region.id, exc)
+            logger.warning("[doc r=%s] preview send failed: %s", rid, exc)
 
     new_doc_file_id: str | None = None
     try:
@@ -421,12 +490,13 @@ async def _send_region_doc(bot, chat_id: int, region: Region) -> None:
         )
         if msg and msg.document:
             new_doc_file_id = msg.document.file_id
+        logger.info("[doc r=%s] doc sent file_id=%s", rid, new_doc_file_id)
     except Exception as exc:
-        logger.warning("Doc send failed for region %s: %s", region.id, exc)
+        logger.warning("[doc r=%s] doc send failed: %s", rid, exc)
 
     if new_doc_file_id or new_preview_file_id:
         async with async_session() as session:
-            fresh = await session.get(Region, region.id)
+            fresh = await session.get(Region, rid)
             if fresh:
                 if new_doc_file_id:
                     fresh.doc_file_id = new_doc_file_id
@@ -434,6 +504,15 @@ async def _send_region_doc(bot, chat_id: int, region: Region) -> None:
                     fresh.doc_preview_file_id = new_preview_file_id
                 fresh.doc_etag = current_etag
                 await session.commit()
+        logger.info(
+            "[doc r=%s] cache updated doc=%s preview=%s etag=%r",
+            rid,
+            bool(new_doc_file_id),
+            bool(new_preview_file_id),
+            current_etag,
+        )
+    else:
+        logger.info("[doc r=%s] nothing to cache", rid)
 
 
 def _gdrive_to_download(url: str) -> str:
