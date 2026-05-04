@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import time
 import bcrypt
@@ -197,20 +198,58 @@ async def _fetch_drive_etag(url: str) -> str | None:
 
 def _render_xlsx_preview_sync(xlsx_bytes: bytes) -> bytes | None:
     """Render the first sheet of an xlsx file to JPEG bytes via LibreOffice + poppler."""
-    from pdf2image import convert_from_path
+    # Sanity check: xlsx is a ZIP, must start with "PK". Drive sometimes returns an
+    # HTML virus-scan interstitial for large files instead of the actual document.
+    if not xlsx_bytes.startswith(b"PK"):
+        logger.warning(
+            "xlsx preview skipped: payload is not a zip (got %r...)", xlsx_bytes[:16]
+        )
+        return None
+
+    try:
+        from pdf2image import convert_from_path
+    except ImportError:
+        logger.warning("pdf2image not installed — rebuild Docker image")
+        return None
 
     workdir = tempfile.mkdtemp(prefix="xlsx_preview_")
+    profile_dir = tempfile.mkdtemp(prefix="lo_profile_")
     try:
         src_path = os.path.join(workdir, "doc.xlsx")
         with open(src_path, "wb") as f:
             f.write(xlsx_bytes)
 
-        result = os.system(
-            f"soffice --headless --convert-to pdf --outdir {workdir} {src_path} >/dev/null 2>&1"
-        )
+        # Per-call user profile prevents the well-known LibreOffice locking hang
+        # when multiple soffice invocations share the default ~/.config profile.
+        try:
+            proc = subprocess.run(
+                [
+                    "soffice",
+                    f"-env:UserInstallation=file://{profile_dir}",
+                    "--headless",
+                    "--convert-to",
+                    "pdf",
+                    "--outdir",
+                    workdir,
+                    src_path,
+                ],
+                capture_output=True,
+                timeout=60,
+            )
+        except subprocess.TimeoutExpired:
+            logger.warning("LibreOffice conversion timed out")
+            return None
+        except FileNotFoundError:
+            logger.warning("soffice binary not found — rebuild Docker image")
+            return None
+
         pdf_path = os.path.join(workdir, "doc.pdf")
-        if result != 0 or not os.path.exists(pdf_path):
-            logger.warning("LibreOffice conversion failed for xlsx preview")
+        if proc.returncode != 0 or not os.path.exists(pdf_path):
+            logger.warning(
+                "LibreOffice conversion failed (rc=%s): %s",
+                proc.returncode,
+                proc.stderr[:300] if proc.stderr else "",
+            )
             return None
 
         images = convert_from_path(pdf_path, dpi=150, first_page=1, last_page=1)
@@ -225,6 +264,7 @@ def _render_xlsx_preview_sync(xlsx_bytes: bytes) -> bytes | None:
         return None
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
+        shutil.rmtree(profile_dir, ignore_errors=True)
 
 
 async def _render_xlsx_preview(download_url: str) -> bytes | None:
@@ -263,7 +303,11 @@ async def _send_region_doc(bot, chat_id: int, region: Region) -> None:
             cache_valid = False
 
     if not cache_valid or not region.doc_preview_file_id:
-        preview_bytes = await _render_xlsx_preview(download_url)
+        try:
+            preview_bytes = await _render_xlsx_preview(download_url)
+        except Exception as exc:
+            logger.warning("Preview render crashed for region %s: %s", region.id, exc)
+            preview_bytes = None
         if preview_bytes:
             try:
                 msg = await bot.send_photo(
