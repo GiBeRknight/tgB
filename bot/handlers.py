@@ -267,8 +267,17 @@ def _render_xlsx_preview_sync(xlsx_bytes: bytes) -> bytes | None:
         shutil.rmtree(profile_dir, ignore_errors=True)
 
 
-async def _download_drive_file(download_url: str) -> bytes | None:
-    """Fetch a Google Drive file, transparently handling the virus-scan confirm page."""
+_MAGIC = {"xlsx": b"PK", "pdf": b"%PDF"}
+
+
+async def _download_drive_file(download_url: str, kind: str = "xlsx") -> bytes | None:
+    """Fetch a Google Drive/Sheets export, handling the virus-scan confirm page.
+
+    `kind` selects the expected magic bytes ("xlsx" or "pdf"); payloads that
+    don't match (e.g. an HTML editor page returned for a Sheets URL with no
+    /export suffix) are rejected.
+    """
+    expected_magic = _MAGIC.get(kind, b"")
     try:
         async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
             r = await client.get(download_url)
@@ -301,9 +310,11 @@ async def _download_drive_file(download_url: str) -> bytes | None:
                 r.raise_for_status()
                 content = r.content
 
-            if not content.startswith(b"PK"):
+            if expected_magic and not content.startswith(expected_magic):
                 logger.warning(
-                    "Drive payload is not a zip after confirm (got %r...)", content[:16]
+                    "Drive payload magic mismatch for kind=%s (got %r...)",
+                    kind,
+                    content[:16],
                 )
                 return None
             return content
@@ -312,16 +323,35 @@ async def _download_drive_file(download_url: str) -> bytes | None:
         return None
 
 
+def _render_pdf_preview_sync(pdf_bytes: bytes) -> bytes | None:
+    """Render the first page of a PDF to JPEG bytes via poppler."""
+    try:
+        from pdf2image import convert_from_bytes
+    except ImportError:
+        logger.warning("pdf2image not installed — rebuild Docker image")
+        return None
+    try:
+        images = convert_from_bytes(pdf_bytes, dpi=150, first_page=1, last_page=1)
+        if not images:
+            return None
+        buf = io.BytesIO()
+        images[0].convert("RGB").save(buf, format="JPEG", quality=85, optimize=True)
+        return buf.getvalue()
+    except Exception as exc:
+        logger.warning("PDF preview render failed: %s", exc)
+        return None
+
+
 async def _send_region_doc(bot, chat_id: int, region: Region) -> None:
     """Send the accessibility document plus a JPEG preview of its first page."""
     if not region.link_doc:
         return
-    download_url = _gdrive_to_download(region.link_doc)
-    current_etag = await _fetch_drive_etag(download_url)
+    xlsx_url, pdf_url = _gdrive_export_urls(region.link_doc)
+    current_etag = await _fetch_drive_etag(xlsx_url)
 
     cache_valid = bool(current_etag) and current_etag == region.doc_etag
 
-    # Fast path: both preview and doc are cached and Drive file unchanged.
+    # Fast path: both preview and doc are cached and source unchanged.
     if cache_valid and region.doc_preview_file_id and region.doc_file_id:
         preview_ok = False
         try:
@@ -345,16 +375,30 @@ async def _send_region_doc(bot, chat_id: int, region: Region) -> None:
             logger.warning("Cached doc send failed for region %s: %s", region.id, exc)
 
     # Slow path: download bytes once, use for both preview and document.
-    xlsx_bytes = await _download_drive_file(download_url)
+    xlsx_bytes = await _download_drive_file(xlsx_url, kind="xlsx")
     if not xlsx_bytes:
         return
 
+    # Prefer the native PDF export (Google Sheets) — skips LibreOffice entirely.
     new_preview_file_id: str | None = None
-    try:
-        preview_bytes = await asyncio.to_thread(_render_xlsx_preview_sync, xlsx_bytes)
-    except Exception as exc:
-        logger.warning("Preview render crashed for region %s: %s", region.id, exc)
-        preview_bytes = None
+    preview_bytes: bytes | None = None
+    if pdf_url:
+        pdf_bytes = await _download_drive_file(pdf_url, kind="pdf")
+        if pdf_bytes:
+            try:
+                preview_bytes = await asyncio.to_thread(
+                    _render_pdf_preview_sync, pdf_bytes
+                )
+            except Exception as exc:
+                logger.warning("PDF preview crashed for region %s: %s", region.id, exc)
+
+    if preview_bytes is None:
+        try:
+            preview_bytes = await asyncio.to_thread(_render_xlsx_preview_sync, xlsx_bytes)
+        except Exception as exc:
+            logger.warning("xlsx preview crashed for region %s: %s", region.id, exc)
+            preview_bytes = None
+
     if preview_bytes:
         try:
             msg = await bot.send_photo(
@@ -394,15 +438,29 @@ async def _send_region_doc(bot, chat_id: int, region: Region) -> None:
 
 def _gdrive_to_download(url: str) -> str:
     """Convert a Google Drive view/share URL to a direct download URL."""
-    # Pattern: https://drive.google.com/file/d/FILE_ID/view...
+    xlsx_url, _ = _gdrive_export_urls(url)
+    return xlsx_url
+
+
+def _gdrive_export_urls(url: str) -> tuple[str, str | None]:
+    """Return (xlsx_url, pdf_url). pdf_url is None for non-Sheets sources."""
+    # Native Google Sheets — export endpoint serves real xlsx/pdf bytes.
+    m = re.search(r"docs\.google\.com/spreadsheets/d/([^/?#]+)", url)
+    if m:
+        sid = m.group(1)
+        return (
+            f"https://docs.google.com/spreadsheets/d/{sid}/export?format=xlsx",
+            f"https://docs.google.com/spreadsheets/d/{sid}/export?format=pdf&portrait=false",
+        )
+    # Drive uploaded file: drive.google.com/file/d/FILE_ID/view...
     m = re.search(r"drive\.google\.com/file/d/([^/]+)", url)
     if m:
-        return f"https://drive.google.com/uc?export=download&id={m.group(1)}"
-    # Pattern: https://drive.google.com/open?id=FILE_ID
+        return (f"https://drive.google.com/uc?export=download&id={m.group(1)}", None)
+    # Drive uploaded file: drive.google.com/open?id=FILE_ID
     m = re.search(r"drive\.google\.com/open\?id=([^&]+)", url)
     if m:
-        return f"https://drive.google.com/uc?export=download&id={m.group(1)}"
-    return url
+        return (f"https://drive.google.com/uc?export=download&id={m.group(1)}", None)
+    return (url, None)
 
 
 # ──────────────────────────────────────
